@@ -1,0 +1,23 @@
+# Python environments and caches
+__pycache__/
+*.py[cod]
+/.venv/
+/.deps/
+/runtime/
+
+# Build products are distributed separately from source
+/dist/
+*.exe
+*.zip
+
+# Local business data and machine settings
+/data/
+/demo-data/
+/local-settings.json
+
+# Development output
+/.test-*/
+/.test-*.json
+/.pytest_cache/
+/startup-error.log
+/test-results.txt

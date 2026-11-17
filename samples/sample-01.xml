@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Invoice>
+  <InvoiceNumber>26000000000000000001</InvoiceNumber><IssueDate>2026-10-01</IssueDate>
+  <BuyerInformation><BuyerName>示例科技有限公司</BuyerName><BuyerTaxID>91440300MA0000000X</BuyerTaxID></BuyerInformation>
+  <SellerName>合成样本商户</SellerName><TotalWithTax>600.00</TotalWithTax>
+</Invoice>
