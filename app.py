@@ -1,16 +1,15 @@
 """Desktop entry point, also used by the portable Windows launcher."""
 from pathlib import Path
-import os
 import sys
 import traceback
 
+from invoice_workbench.runtime import configure_bundled_tk, require_python
+
 if __name__ == "__main__":
     root = Path(__file__).resolve().parent
-    runtime = root / "runtime"
-    if runtime.is_dir():
-        os.environ["TCL_LIBRARY"] = str(runtime / "tcl" / "tcl8.6")
-        os.environ["TK_LIBRARY"] = str(runtime / "tcl" / "tk8.6")
+    require_python()
     try:
+        configure_bundled_tk()
         from invoice_workbench.gui import main
         main()
     except Exception:

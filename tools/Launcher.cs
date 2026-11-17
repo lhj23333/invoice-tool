@@ -32,8 +32,6 @@ internal static class Launcher
             start.WorkingDirectory = root;
             start.UseShellExecute = false;
             start.CreateNoWindow = true;
-            start.EnvironmentVariables["TCL_LIBRARY"] = Path.Combine(root, "runtime", "tcl", "tcl8.6");
-            start.EnvironmentVariables["TK_LIBRARY"] = Path.Combine(root, "runtime", "tcl", "tk8.6");
             var process = Process.Start(start);
             process.WaitForExit();
             if (process.ExitCode != 0) MessageBox.Show("启动或运行失败，请查看程序目录的 startup-error.log。", "发票工作台");

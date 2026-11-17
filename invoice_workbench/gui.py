@@ -79,6 +79,7 @@ class Workbench(tk.Tk):
             # Older versions let users mistake an invoice folder for a workspace.
             # Never create index/session files in that source folder.
             import_source, directory = directory, APP_ROOT / "data"
+        self.connection_directory = Path(directory).expanduser()
         try:
             self.open_library(directory)
         except (UserError, OSError, ValueError) as exc:
@@ -325,7 +326,10 @@ class Workbench(tk.Tk):
         self.settings_file.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def open_library(self, directory):
-        if self.store and self.store.root == Path(directory).resolve():
+        directory = Path(directory).expanduser()
+        if not self.store:
+            self.connection_directory = directory
+        if self.store and self.store.root == directory.resolve():
             if not self.reload():
                 raise UserError(self.status_text.get())
             return
@@ -337,6 +341,7 @@ class Workbench(tk.Tk):
             raise
         old = self.store
         self.store = new
+        self.connection_directory = new.root
         if old:
             old.close()
         self.settings["data_directory"] = str(new.root)
@@ -382,7 +387,8 @@ class Workbench(tk.Tk):
     def reconnect_library(self):
         if self.busy or not self.allow_discard():
             return
-        directory = self.store.root if self.store else Path(self.settings.get("data_directory", str(APP_ROOT / "data")))
+        directory = self.store.root if self.store else self.connection_directory
+        self.connection_directory = directory
         if self.store:
             self.store.close()
             self.store = None
@@ -396,7 +402,7 @@ class Workbench(tk.Tk):
             self.connection_error(str(exc))
             # Local live writers remain protected by the OS guard even during recovery.
             if "未结束的会话" in str(exc) and messagebox.askyesno(
-                    "恢复资料连接", "仅在其他电脑上的工具已关闭、网盘同步已完成时恢复。\n\n确认恢复此资料库的遗留会话？", parent=self):
+                    "恢复资料连接", f"资料库：{directory}\n\n仅在其他电脑上的工具已关闭、网盘同步已完成时恢复。\n\n确认恢复此资料库的遗留会话？", parent=self):
                 try:
                     Store(directory, recover_lock=True).close()
                     self.open_library(directory)

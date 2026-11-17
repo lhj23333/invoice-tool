@@ -17,8 +17,8 @@ def from_text(text: str) -> dict:
     text = text.replace("\u3000", " ").replace("：", ":")
     result = {"raw_text": text[:30000], "method": "PDF 文字提取", "warnings": []}
 
-    def first(pattern: str) -> str:
-        match = re.search(pattern, text, re.I)
+    def first(pattern: str, source: str = text) -> str:
+        match = re.search(pattern, source, re.I)
         return match.group(1).strip() if match else ""
 
     result["number"] = first(r"(?:发\s*票\s*号\s*码|Invoice\s*(?:No\.?|Number))\s*:?\s*(\d{20}|\d{8})(?!\d)")
@@ -27,15 +27,19 @@ def from_text(text: str) -> dict:
     if dt:
         parts = re.findall(r"\d+", dt)
         result["date"] = f"{int(parts[0]):04}-{int(parts[1]):02}-{int(parts[2]):02}"
-    amount = first(r"(?:价\s*税\s*合\s*计\s*(?:\([^)]*\))?|Total\s*(?:with\s*Tax|Amount))[^\d\n-]{0,25}(-?[\d,]+\.\d{2})(?!\d)")
+    amount_text = text.replace("−", "-").replace("－", "-")
+    # 将负号和货币符号一起保留，前面的排版文字不能吞掉负号。
+    amount_pattern = r"(-?\s*[¥￥]?\s*-?\s*[\d,]+\.\d{2})(?!\d)"
+    amount = first(r"(?:价\s*税\s*合\s*计\s*(?:\([^)]*\))?|Total\s*(?:with\s*Tax|Amount))[^\d\n¥￥-]{0,25}" + amount_pattern, amount_text)
     if not amount:
-        amount = first(r"(?:小\s*写)\s*[)）]?\s*[:¥￥]?\s*¥?\s*(-?[\d,]+\.\d{2})(?!\d)")
+        amount = first(r"小\s*写\s*[)）]?\s*:?\s*" + amount_pattern, amount_text)
     if not amount:
-        # Some PDFs reorder the uppercase wording between 小写 and its currency.
-        amount = first(r"小\s*写[^¥￥\n]{0,160}[¥￥]\s*(-?[\d,]+\.\d{2})(?!\d)")
+        # 部分 PDF 将大写金额排在“小写”和货币符号之间。
+        currency_amount_pattern = r"(-?\s*[¥￥]\s*-?\s*[\d,]+\.\d{2})(?!\d)"
+        amount = first(r"小\s*写[^¥￥\n-]{0,160}" + currency_amount_pattern, amount_text)
     if amount:
         try:
-            result["amount_cents"] = money(amount)
+            result["amount_cents"] = money(re.sub(r"\s+", "", amount))
         except UserError as exc:
             result["warnings"].append(str(exc))
     # Avoid accidentally taking the seller's tax ID from an unscoped match.
@@ -74,7 +78,12 @@ def from_text(text: str) -> dict:
 def from_xml(data: bytes) -> dict:
     if re.search(br"<!\s*(?:DOCTYPE|ENTITY)\b", data, re.I) or b"\x00" in data:
         raise UserError("不支持含 DTD、实体定义或非 UTF-8/GB 编码的 XML。")
-    root = ET.fromstring(data)
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise UserError("XML 格式无效。") from exc
+    except (LookupError, ValueError) as exc:
+        raise UserError(f"XML 编码无法解析：{exc}") from exc
     def tag(node):
         return node.tag.rsplit("}", 1)[-1].lower()
 
@@ -118,10 +127,7 @@ def extract(data: bytes, suffix: str) -> dict:
     if not data:
         raise UserError("文件为空。")
     if suffix == ".xml":
-        try:
-            return from_xml(data)
-        except ET.ParseError:
-            raise UserError("XML 格式无效。") from None
+        return from_xml(data)
     if suffix == ".pdf":
         if not data.startswith(b"%PDF-"):
             raise UserError("文件内容不是有效的 PDF。")

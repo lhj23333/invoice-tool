@@ -4,14 +4,14 @@ import os
 
 from .domain import UserError
 from .extract import SUPPORTED
+from .filesystem import is_directory_link
 
 MANAGED = {"objects", "history", "exports", "backups", ".git", ".venv", "node_modules", "__pycache__"}
 
 
 def contains_invoices(directory):
     for base, dirs, names in os.walk(directory, followlinks=False):
-        dirs[:] = [d for d in dirs if d not in MANAGED and not (Path(base) / d).is_symlink()
-                   and not (Path(base) / d).is_junction()]
+        dirs[:] = [d for d in dirs if d not in MANAGED and not is_directory_link(Path(base) / d)]
         if any(Path(n).suffix.lower() in SUPPORTED | {".eml"} for n in names):
             return True
     return False

@@ -17,6 +17,7 @@ import zipfile
 
 from .domain import UserError, choose_invoices, company_matches, identity, money, validate_invoice, yuan
 from .extract import MAX_BYTES, SUPPORTED, eml_attachments, extract
+from .filesystem import is_directory_link
 from .session import WriterGuard, process_running
 
 
@@ -284,7 +285,7 @@ class Store:
         files = []
         if recursive:
             for base, dirs, names in os.walk(source, followlinks=False):
-                dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink() and not (Path(base) / d).is_junction()
+                dirs[:] = [d for d in dirs if not is_directory_link(Path(base) / d)
                            and d not in {".git", "node_modules", ".venv", "__pycache__"}
                            and (Path(base) / d).resolve() not in skipped]
                 files.extend(Path(base) / n for n in names if Path(n).suffix.lower() in SUPPORTED | {".eml"})

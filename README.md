@@ -1,10 +1,6 @@
 # Invoice Workbench - Windows 发票管理工具
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.12-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/Platform-Windows-green.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/GUI-Tkinter-orange.svg" alt="GUI">
-</p>
+![Python](https://img.shields.io/badge/Python-%3E%3D3.11-blue.svg)![Platform](https://img.shields.io/badge/Platform-Windows-green.svg)![GUI](https://img.shields.io/badge/GUI-Tkinter-orange.svg)
 
 **Invoice Workbench** 是基于 **Python + Tkinter** 的本地发票管理工具，支持发票收集、信息核对、组合选票和报销批次导出。
 
@@ -24,15 +20,27 @@
 
 ### 安装与启动
 
-需要 **Windows Python 3.12（含 Tcl/Tk）**，在项目根目录执行：
+需要 **Windows Python 3.11 及以上的 Python 3（含 Tcl/Tk 和 pip）**。固定依赖中的 Pillow 13 要求 Python >= 3.11；
 
 ```powershell
-$python = py -3.12 -c "import sys; print(sys.executable)"
-.\setup.ps1 -Python $python
+.\setup.ps1
 .\start.ps1
 ```
 
-已有便携包时，解压后双击 `InvoiceWorkbench.exe` 即可，无需另外安装 Python。
+脚本自动检查项目运行环境、已激活的 Python 环境、PATH 中的 Python、已注册的 Python 安装和 `py -3`，支持虚拟环境的 `Scripts` 与 `bin` 目录。安装依赖后会检查依赖能否加载；
+
+需要指定解释器时，可使用 `-Python` 传入可执行文件路径或命令名：
+
+```powershell
+.\setup.ps1 -Python "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe"
+.\start.ps1 -CheckEnvironment
+```
+
+`start.ps1` 同样支持 `-Python`。显式指定的解释器不满足要求时会显示错误。
+
+切换 Python 安装时需要重新创建项目的 `.venv`；脚本会在发现已有虚拟环境属于其他 Python 安装时停止，防止混用不同版本的库。
+
+便携包根据构建解释器动态确定 Python DLL、标准库归档及 Tcl/Tk 路径。已有便携包时，解压后双击 `InvoiceWorkbench.exe` 即可，无需另外安装 Python。
 
 ### 基本使用
 

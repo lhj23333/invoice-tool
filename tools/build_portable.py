@@ -14,6 +14,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from invoice_workbench import __version__
+from invoice_workbench.runtime import require_python
 
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
 
@@ -24,18 +25,25 @@ def copy_file(source, destination):
 
 
 def copy_runtime(destination):
+    require_python()
     original = Path(sys.base_prefix)
-    if (original / "python312._pth").exists() and (original / "python312.zip").exists():
+    library = Path(sysconfig.get_config_var("LDLIBRARY"))
+    runtime_name = library.stem
+    if (original / f"{runtime_name}._pth").exists():
         shutil.copytree(original, destination, ignore=IGNORE)
         return
+    if not (original / "DLLs").is_dir() or not (original / "tcl").is_dir():
+        raise ValueError("便携包构建需要包含 DLLs 和 tcl 的标准 Windows CPython 发行环境。")
     destination.mkdir()
-    for name in ("python.exe", "pythonw.exe", "python3.dll", "python312.dll", "vcruntime140.dll", "vcruntime140_1.dll", "LICENSE.txt"):
+    for name in ("python.exe", "pythonw.exe", library.name, "LICENSE.txt"):
+        copy_file(original / name, destination / name)
+    for name in ("python3.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
         if (original / name).exists():
             copy_file(original / name, destination / name)
     shutil.copytree(original / "DLLs", destination / "DLLs", ignore=IGNORE)
     shutil.copytree(original / "tcl", destination / "tcl", ignore=IGNORE)
     stdlib = Path(sysconfig.get_path("stdlib"))
-    with zipfile.ZipFile(destination / "python312.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(destination / f"{runtime_name}.zip", "w", zipfile.ZIP_DEFLATED) as archive:
         for base, dirs, names in os.walk(stdlib):
             dirs[:] = [d for d in dirs if d not in {"site-packages", "__pycache__", "test", "tests", "idlelib", "turtledemo", "ensurepip"}]
             for name in names:
@@ -49,7 +57,8 @@ def copy_runtime(destination):
             path = Path(distribution.locate_file(file)).resolve()
             if path.is_relative_to(package_root) and path.is_file() and path.suffix != ".pyc":
                 copy_file(path, destination / "Lib" / "site-packages" / path.relative_to(package_root))
-    (destination / "python312._pth").write_text("python312.zip\nDLLs\nLib/site-packages\n..\nimport site\n", encoding="ascii")
+    (destination / f"{runtime_name}._pth").write_text(
+        f"{runtime_name}.zip\nDLLs\nLib/site-packages\n..\nimport site\n", encoding="ascii")
 
 
 def build(destination):
@@ -61,11 +70,21 @@ def build(destination):
     archive = destination.parent / f"InvoiceWorkbench-Windows-v{__version__}.zip"
     if archive.exists():
         raise ValueError("Archive already exists")
+    files = ("app.py", "README.md", "requirements.txt", "AGENTS.md", "setup.ps1", "start.ps1", "Install-ToSoft.ps1")
+    directories = ("invoice_workbench", "samples", "tests", "tools")
+    for name in files:
+        if not (ROOT / name).is_file():
+            raise FileNotFoundError(f"构建缺少必需文件：{ROOT / name}")
+    for name in directories:
+        if not (ROOT / name).is_dir():
+            raise FileNotFoundError(f"构建缺少必需目录：{ROOT / name}")
     destination.mkdir(parents=True)
-    for name in ("app.py", "README.md", "requirements.txt", "AGENTS.md", "setup.ps1", "start.ps1", "Install-ToSoft.ps1"):
+    for name in files:
         copy_file(ROOT / name, destination / name)
-    for name in ("invoice_workbench", "samples", "tests", "tools", "docs"):
+    for name in directories:
         shutil.copytree(ROOT / name, destination / name, ignore=IGNORE)
+    if (ROOT / "docs").is_dir():
+        shutil.copytree(ROOT / "docs", destination / "docs", ignore=IGNORE)
     copy_runtime(destination / "runtime")
     compiler = Path(os.environ.get("WINDIR", "C:/Windows")) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
     subprocess.run([str(compiler), "/nologo", "/target:winexe", "/reference:System.Windows.Forms.dll",
