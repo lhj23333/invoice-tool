@@ -11,11 +11,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
-from .domain import UserError, identity, yuan
-from .labels import STATUS, state_label
+from .domain import UserError, yuan
+from .labels import INVOICE_STATUS, selectable, state_label
 from .selection import SelectionDialog
-from .store import Store
-from .workflow import contains_invoices, import_directory
+from .store import OCCUPIED_STATUSES, Store
+from .workflow import contains_invoices, import_directory, remove_duplicate_files
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 BG, WHITE, INK, MUTED, ACCENT = "#f4f6f8", "#ffffff", "#202a35", "#687687", "#167365"
@@ -40,6 +40,52 @@ class PageStack(ttk.Frame):
         self.frames[index].grid(row=0, column=0, sticky="nsew")
         self.current_index = index
         self.changed(index)
+
+
+class DuplicateFilesDialog(tk.Toplevel):
+    def __init__(self, owner, source, duplicates):
+        super().__init__(owner)
+        self.title("整理重复发票文件")
+        self.geometry("900x480")
+        self.minsize(650, 350)
+        self.transient(owner)
+        self.grab_set()
+        self.accepted = False
+        panel = ttk.Frame(self, padding=18)
+        panel.pack(fill="both", expand=True)
+        ttk.Label(panel, text=f"发现 {len(duplicates)} 个内容完全相同的发票副本。每组保留一份原件，工作区副本已校验。", wraplength=840).pack(anchor="w")
+        ttk.Label(panel, text=f"源目录：{source}", wraplength=840).pack(anchor="w", pady=(6, 12))
+        actions = ttk.Frame(panel)
+        actions.pack(side="top", fill="x", pady=(0, 12))
+        self.no_button = ttk.Button(actions, text="否，保留文件并继续", command=self.destroy)
+        self.no_button.pack(side="right")
+        self.yes_button = ttk.Button(actions, text="是，删除重复文件", command=self.accept)
+        self.yes_button.pack(side="right", padx=(0, 10))
+        listing = ttk.Frame(panel)
+        listing.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(listing, columns=("remove", "keep"), show="headings")
+        from tkinter import font
+        text_font = font.nametofont("TkDefaultFont")
+        for key, title in (("remove", "将删除的重复文件"), ("keep", "保留的原件")):
+            self.tree.heading(key, text=title)
+            width = max(400, *(text_font.measure(str(Path(d[key]).relative_to(source))) + 24 for d in duplicates))
+            self.tree.column(key, width=width, minwidth=200, stretch=False)
+        vertical = ttk.Scrollbar(listing, orient="vertical", command=self.tree.yview)
+        horizontal = ttk.Scrollbar(listing, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.pack(side="right", fill="y")
+        horizontal.pack(side="bottom", fill="x")
+        self.tree.pack(fill="both", expand=True)
+        for duplicate in duplicates:
+            self.tree.insert("", "end", values=tuple(str(Path(duplicate[key]).relative_to(source)) for key in ("remove", "keep")))
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.no_button.focus_set()
+        self.update_idletasks()
+        self.lift()
+
+    def accept(self):
+        self.accepted = True
+        self.destroy()
 
 
 class Workbench(tk.Tk):
@@ -131,8 +177,8 @@ class Workbench(tk.Tk):
         tk.Label(sidebar, text="INVOICE WORKBENCH", bg="#e8eeec", fg=MUTED,
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=18, pady=(0, 28))
         self.page_specs = [
-            ("发票资料", "导入已有发票，核对信息后按额度准备报销。", self._library_page),
-            ("报销批次", "查看批次、导出报销材料，并更新报销进度。", self._batch_page),
+            ("发票资料", "导入时自动核验和整理重复文件，按额度准备报销，并管理每张发票的状态。", self._library_page),
+            ("报销批次", "查看选票记录，导出发票文件与 CSV 明细。", self._batch_page),
             ("设置", "管理发票资料库与报销公司。", self._settings_page),
         ]
         self.nav_buttons = []
@@ -176,7 +222,7 @@ class Workbench(tk.Tk):
         self.stats_frame = ttk.Frame(page)
         self.stats_frame.pack(fill="x", pady=(0, 14))
         self.stats = []
-        for title in ("发票记录", "待核对 / 冲突", "可用票面合计", "已占用"):
+        for title in ("发票记录", "核验异常 / 冲突", "可用票面合计", "已占用"):
             card = ttk.Frame(self.stats_frame, style="Card.TFrame", padding=(14, 8))
             card.pack(side="left", fill="x", expand=True, padx=(0, 8))
             ttk.Label(card, text=title, style="Card.TLabel").pack(anchor="w")
@@ -196,7 +242,7 @@ class Workbench(tk.Tk):
         filters = ttk.Frame(page)
         filters.pack(fill="x", pady=(0, 10))
         self.filter = tk.StringVar(value="全部")
-        combo = ttk.Combobox(filters, textvariable=self.filter, values=["全部", "待核对", "可用", "已占用", "同票冲突", "公司不匹配", "已移出"], state="readonly", width=15)
+        combo = ttk.Combobox(filters, textvariable=self.filter, values=["全部", *INVOICE_STATUS.values(), "核验异常", "同票冲突", "公司不匹配", "已移出"], state="readonly", width=15)
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", lambda e: self.fill_invoices())
         self.list_summary = tk.StringVar(value="还没有发票，点击上方“导入发票文件夹”开始。")
@@ -225,7 +271,7 @@ class Workbench(tk.Tk):
         self.tree.bind("<Double-1>", lambda e: self.show_detail() if self.current_id else None)
         self.tree.tag_configure("pending", foreground="#9b6c20")
         self.tree.tag_configure("occupied", foreground=MUTED)
-        self.details_title = tk.StringVar(value="选择一张发票进行核对")
+        self.details_title = tk.StringVar(value="选择一张发票查看详情")
         detail_header = ttk.Frame(right, style="Card.TFrame")
         detail_header.pack(fill="x", pady=(0, 10))
         ttk.Button(detail_header, text="收起", command=self.hide_detail).pack(side="right")
@@ -252,7 +298,7 @@ class Workbench(tk.Tk):
         self.bind_all("<MouseWheel>", scroll_form, add="+")
         preview = ttk.Frame(self.details, style="Card.TFrame", padding=8)
         text_page = ttk.Frame(self.details, style="Card.TFrame", padding=8)
-        self.details.add(form_page, text="字段核对")
+        self.details.add(form_page, text="发票详情")
         self.details.add(preview, text="原票预览")
         self.details.add(text_page, text="提取文本")
         self.fields, self.entries = {}, []
@@ -265,14 +311,23 @@ class Workbench(tk.Tk):
             self.fields[key] = var
             self.entries.append(entry)
         form.columnconfigure(1, weight=1)
-        self.warning_text = tk.StringVar(value="导入文件后，关键字段将在这里显示。")
-        ttk.Label(form, textvariable=self.warning_text, style="Card.TLabel", foreground="#9b6c20", wraplength=390).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 6))
-        self.review_button = ttk.Button(form, text="保存并标记已核对", command=self.save_review, style="Accent.TButton")
+        ttk.Label(form, text="报销状态", style="Card.TLabel").grid(row=8, column=0, sticky="w", pady=4)
+        self.invoice_status = tk.StringVar()
+        self.status_choice = ttk.Combobox(form, textvariable=self.invoice_status, values=list(INVOICE_STATUS.values()), state="disabled")
+        self.status_choice.grid(row=8, column=1, sticky="ew", padx=(12, 0), pady=4)
+        self.status_choice.bind("<<ComboboxSelected>>", self.change_invoice_status)
+        def scroll_status(event):
+            form_canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+        self.status_choice.bind("<MouseWheel>", scroll_status)
+        ttk.Label(form, text="已退回或可用会释放当前批次占用，自动核验通过且公司匹配时可再次选用。", style="Card.TLabel", wraplength=390).grid(row=9, column=0, columnspan=2, sticky="w", pady=6)
+        self.warning_text = tk.StringVar(value="导入文件后，自动核验结果将在这里显示。")
+        ttk.Label(form, textvariable=self.warning_text, style="Card.TLabel", foreground="#9b6c20", wraplength=390).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 6))
+        self.review_button = ttk.Button(form, text="保存字段修改", command=self.save_review, style="Accent.TButton")
         self.actions.append(self.review_button)
-        self.review_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        self.review_button.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(4, 6))
         form_actions = ttk.Frame(form, style="Card.TFrame")
-        form_actions.grid(row=10, column=0, columnspan=2, sticky="ew")
-        self.button(form_actions, "合并同票文件", self.merge_invoice, side="left", padx=(0, 6))
+        form_actions.grid(row=12, column=0, columnspan=2, sticky="ew")
         self.archive_button = self.button(form_actions, "移出候选", self.archive_invoice, side="left")
         filebar = ttk.Frame(preview, style="Card.TFrame")
         filebar.pack(fill="x")
@@ -291,12 +346,10 @@ class Workbench(tk.Tk):
         actions = ttk.Frame(page)
         actions.pack(fill="x", pady=(0, 12))
         self.button(actions, "导出原票与明细", self.export_batch, True, side="left")
-        for text, state in (("标记已提交", "submitted"), ("标记已报销", "reimbursed"), ("标记已退回", "returned"), ("取消并释放", "cancelled")):
-            self.button(actions, text, lambda s=state: self.transition_batch(s), side="left", padx=(8, 0))
-        ttk.Label(page, text="整票占用，超额不结转。导出不改变报销进度；退回保持占用，取消后释放。", style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
-        columns = ("time", "count", "target", "total", "declared", "status")
+        ttk.Label(page, text="整票占用，超额不结转。每张发票的报销状态在“发票资料”详情中管理；这里保留批次历史。", style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
+        columns = ("time", "count", "target", "total", "declared")
         self.batch_tree = ttk.Treeview(page, columns=columns, show="headings", selectmode="browse")
-        for key, title, width in zip(columns, ("创建时间", "张数", "目标 / 元", "票面 / 元", "申报 / 元", "状态"), (200, 65, 130, 130, 130, 110)):
+        for key, title, width in zip(columns, ("创建时间", "张数", "目标 / 元", "票面 / 元", "申报 / 元"), (200, 65, 130, 130, 130)):
             self.batch_tree.heading(key, text=title)
             self.batch_tree.column(key, width=width, anchor="w")
         self.batch_tree.pack(fill="both", expand=True)
@@ -308,7 +361,10 @@ class Workbench(tk.Tk):
         ttk.Label(page, text="发票资料库", font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
         self.directory_text = tk.StringVar()
         ttk.Label(page, textvariable=self.directory_text, wraplength=850).pack(anchor="w", pady=8)
-        self.library_button = self.button(page, "切换资料库…", self.choose_library, anchor="w")
+        library_actions = ttk.Frame(page)
+        library_actions.pack(anchor="w")
+        self.library_button = self.button(library_actions, "切换资料库…", self.choose_library, side="left")
+        self.reset_button = self.button(library_actions, "恢复初始化…", self.reset_workspace, side="left", padx=(10, 0))
         ttk.Label(page, text="这里保存发票记录、原件副本和报销批次。添加已有发票，请在“发票资料”页导入文件夹。\n需要换电脑时，将资料库放入网盘；关闭当前窗口并等同步完成后，再在另一台电脑打开。", style="Muted.TLabel", wraplength=920).pack(anchor="w", pady=(12, 24))
         ttk.Label(page, text="报销公司", font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
         self.company_name, self.company_tax = tk.StringVar(), tk.StringVar()
@@ -319,7 +375,7 @@ class Workbench(tk.Tk):
         ttk.Label(page, text="填写税号时精确匹配税号；同时填写抬头时两项都须匹配。", style="Muted.TLabel").pack(anchor="w")
         ttk.Separator(page).pack(fill="x", pady=20)
         ttk.Label(page, text=f"版本 {__version__} · 本地文件整理阶段", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(page, text="支持 PDF 文字层与部分 XML 字段提取、图片预览、人工核对、精确选票和批次导出。\n当前不连接 Outlook，不上传发票；图片 OCR 与扫描 PDF 识别将在真实样本验证后接入。", style="Muted.TLabel", wraplength=850).pack(anchor="w", pady=8)
+        ttk.Label(page, text="支持 PDF 文字层与部分 XML 字段提取、自动核验、重复文件整理、精确选票和批次导出。\n当前不连接 Outlook，不上传发票；图片、OFD 和扫描 PDF 无法自动核验的字段会明确提示。", style="Muted.TLabel", wraplength=850).pack(anchor="w", pady=8)
 
     def _save_settings(self):
         self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -373,10 +429,15 @@ class Workbench(tk.Tk):
         editable = self.session_ok and not self.busy and bool(self.selected_item())
         if editable:
             item = self.selected_item()
-            editable = not item.get("batch_id") and not item.get("archived")
+            editable = item.get("reimbursement_status") not in OCCUPIED_STATUSES and not item.get("archived")
         for entry in self.entries:
             entry.configure(state="normal" if editable else "readonly")
         self.review_button.configure(state="normal" if editable else "disabled")
+        self.status_choice.configure(state="readonly" if self.session_ok and not self.busy and self.selected_item() else "disabled")
+        item = self.selected_item()
+        archivable = (self.session_ok and not self.busy and item
+                      and (item.get("archived") or item.get("reimbursement_status") not in OCCUPIED_STATUSES))
+        self.archive_button.configure(state="normal" if archivable else "disabled")
 
     def connection_error(self, text):
         self.session_ok = False
@@ -421,9 +482,9 @@ class Workbench(tk.Tk):
         self.session_ok = True
         self.reconnect_button.pack_forget()
         invoices = self.snapshot["invoices"]
-        available = [i for i in invoices if state_label(i) == "可用"]
-        values = [str(len(invoices)), str(sum(state_label(i) in {"待核对", "同票冲突"} for i in invoices)),
-                  "¥ " + yuan(sum(i["amount_cents"] for i in available)), str(sum(bool(i.get("batch_id")) for i in invoices))]
+        available = [i for i in invoices if selectable(i)]
+        values = [str(len(invoices)), str(sum(state_label(i) in {"核验异常", "同票冲突"} for i in invoices)),
+                  "¥ " + yuan(sum(i["amount_cents"] for i in available)), str(sum(i["reimbursement_status"] in {"reserved", "submitted", "reimbursed"} for i in invoices))]
         for var, value in zip(self.stats, values):
             var.set(value)
         self.directory_text.set(self.snapshot["data_directory"])
@@ -440,7 +501,7 @@ class Workbench(tk.Tk):
         if not self.snapshot["company"].get("name") and not self.snapshot["company"].get("tax_id"):
             self.status_text.set("可以直接导入发票。按额度选票前，请在“设置”填写报销公司。")
         else:
-            self.status_text.set("已就绪。新导入的发票需核对后参与选票。")
+            self.status_text.set("已就绪。自动核验通过且公司匹配的可用、已退回发票可参与选票。")
         self.update_actions()
         return True
 
@@ -454,11 +515,11 @@ class Workbench(tk.Tk):
                 continue
             if query and query not in " ".join(str(item.get(k, "")) for k in ("number", "buyer_name", "buyer_tax_id", "seller_name")).lower():
                 continue
-            self.tree.insert("", "end", iid=item["id"], values=(item["files"][0]["name"], item["number"] or "待填写票号", item["date"] or "—", yuan(item["amount_cents"]) if item["amount_cents"] else "待填写", status), tags=("occupied" if item.get("batch_id") else "pending" if status in {"待核对", "同票冲突"} else "normal",))
+            self.tree.insert("", "end", iid=item["id"], values=(item["files"][0]["name"], item["number"] or "待填写票号", item["date"] or "—", yuan(item["amount_cents"]) if item["amount_cents"] else "待填写", status), tags=("occupied" if item.get("batch_id") else "pending" if status in {"核验异常", "同票冲突"} else "normal",))
         if selected and self.tree.exists(selected):
             self.tree.selection_set(selected)
         count, total = len(self.tree.get_children()), len(self.snapshot.get("invoices", []))
-        self.list_summary.set(f"显示 {count} / {total} 张 · 点击发票查看与核对" if total else "点击“导入发票文件夹”添加，原文件保持原样。")
+        self.list_summary.set(f"显示 {count} / {total} 张 · 点击发票查看详情与状态" if total else "点击“导入发票文件夹”添加，发现重复副本时可选择删除。")
         if count:
             self.empty_hint.place_forget()
         else:
@@ -490,13 +551,15 @@ class Workbench(tk.Tk):
         self.loading = True
         for var in self.fields.values():
             var.set("")
-        self.loading = self.dirty = False
-        self.details_title.set("选择一张发票进行核对")
+        self.details_title.set("选择一张发票查看详情")
+        self.invoice_status.set("")
+        self.status_choice.configure(state="disabled")
         self.file_choice["values"] = []
         self.preview_generation += 1
         self.image_reference = None
         self.preview_canvas.delete("all")
         self.set_text(self.raw, "")
+        self.loading = self.dirty = False
 
     def load_invoice(self, item):
         self.show_detail()
@@ -504,17 +567,27 @@ class Workbench(tk.Tk):
         self.current_id = item["id"]
         for key, var in self.fields.items():
             var.set(yuan(item["amount_cents"]) if key == "amount" and item["amount_cents"] else item.get(key, ""))
-        self.loading = self.dirty = False
-        self.details_title.set(f"{item['number'] or '待核对发票'} · {state_label(item)}")
-        self.warning_text.set("\n".join(item.get("warnings", [])) or "请对照原票核对号码、日期、价税合计及购买方信息。")
+        self.details_title.set(f"{item['number'] or '字段不完整'} · {state_label(item)}")
+        verification = item.get("verification", {})
+        messages = ["自动核验通过：记录的金额、票号、日期及购买方信息与原件提取结果一致。"] if verification.get("passed") else verification.get("issues", [])
+        if item.get("duplicate"):
+            messages = [*messages, "存在同票号冲突，请修正字段或移出错误记录。"]
+        self.warning_text.set("\n".join(messages))
+        self.status_choice["values"] = [label for status, label in INVOICE_STATUS.items()
+                                        if status != "reserved" or item.get("active_batch_id")]
+        self.invoice_status.set(INVOICE_STATUS[item["reimbursement_status"]])
+        self.status_choice.configure(state="readonly" if self.session_ok and not self.busy else "disabled")
         self.file_choice["values"] = [f["name"] for f in item["files"]]
         self.file_choice.current(0)
-        self.set_text(self.raw, item.get("raw_text", "") or "此文件暂无可提取文字，请打开原件核对并填写字段。")
-        self.archive_button.configure(text="恢复候选" if item.get("archived") else "移出候选")
-        editable = not item.get("batch_id") and not item.get("archived") and not self.busy
+        self.set_text(self.raw, item.get("raw_text", "") or "此文件暂无可提取文字，自动核验无法完成。")
+        archivable = not self.busy and (item.get("archived") or item.get("reimbursement_status") not in OCCUPIED_STATUSES)
+        self.archive_button.configure(text="恢复候选" if item.get("archived") else "移出候选",
+                                      state="normal" if self.session_ok and archivable else "disabled")
+        editable = item.get("reimbursement_status") not in OCCUPIED_STATUSES and not item.get("archived") and not self.busy
         for entry in self.entries:
             entry.configure(state="normal" if editable else "readonly")
         self.review_button.configure(state="normal" if editable and not self.busy else "disabled")
+        self.loading = self.dirty = False
         self.preview_generation += 1
         self.preview_canvas.delete("all")
         if self.details.index("current") == 1:
@@ -615,6 +688,7 @@ class Workbench(tk.Tk):
             b.configure(state="disabled")
         for entry in self.entries:
             entry.configure(state="readonly")
+        self.status_choice.configure(state="disabled")
         self.progress.pack(side="right", padx=(10, 0))
         self.progress.start(12)
 
@@ -691,12 +765,20 @@ class Workbench(tk.Tk):
         elif report["errors"]:
             text += f" · 失败 {len(report['errors'])} 个"
         else:
-            text += "。请选择发票核对信息。"
+            text += "。已完成自动核验。"
         self.status_text.set(text)
         children = self.tree.get_children()
         if children:
             self.tree.selection_set(children[0])
             self.select_invoice()
+        duplicates = report.get("duplicate_files", [])
+        if duplicates:
+            dialog = DuplicateFilesDialog(self, report["source"], duplicates)
+            self.wait_window(dialog)
+            if dialog.accepted:
+                store, revision = self.store, self.snapshot["revision"]
+                self.task("正在整理重复文件…", lambda: remove_duplicate_files(store, revision, report),
+                          lambda count: self.status_text.set(text + f" · 已删除 {count} 个重复副本"))
 
     def save_company(self):
         if self.store:
@@ -704,52 +786,64 @@ class Workbench(tk.Tk):
             revision = self.snapshot["revision"]
             self.task("保存公司设置…", lambda: self.store.set_company(revision, name, tax))
 
+    def reset_workspace(self):
+        if not self.session_ok or not self.store or self.busy:
+            return
+        directory = self.store.root
+        prompt = (f"资料库：{directory}\n\n"
+                  "将清空全部发票记录、报销批次、原件副本、历史记录、资料库内的导出文件、公司信息及其他配置。\n"
+                  "资料库位置和导入源文件保留。尚未保存的修改将清除。\n\n"
+                  "此操作无法撤销。确认恢复初始化？")
+        if not messagebox.askyesno("恢复初始化", prompt, parent=self, icon="warning", default="no"):
+            return
+        store, revision, settings_file = self.store, self.snapshot["revision"], self.settings_file
+        settings = {"data_directory": str(directory)}
+        def work():
+            store.reset(revision)
+            settings_file.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+            return settings
+        def done(settings):
+            self.settings = settings
+            self.current_id = None
+            self.clear_detail()
+            self.search.set("")
+            self.filter.set("全部")
+            self.fill_invoices()
+            self.fill_batches()
+            self.set_text(self.batch_info, "")
+            self.pages.select(2)
+            self.status_text.set("已恢复初始化。资料库已清空，保存位置保持不变。")
+        self.task("正在恢复初始化…", work, done, preserve_edits=False)
+
     def save_review(self):
         item = self.selected_item()
         if item and self.store:
             fields = {k: v.get() for k, v in self.fields.items()}
             invoice_id, revision = item["id"], self.snapshot["revision"]
-            self.task("保存核对结果…", lambda: self.store.review(revision, invoice_id, fields), preserve_edits=False)
+            self.task("保存字段并自动核验…", lambda: self.store.review(revision, invoice_id, fields), preserve_edits=False)
 
     def archive_invoice(self):
         item = self.selected_item()
         if not item or not self.store or not self.allow_discard():
             return
         archived = not item.get("archived", False)
-        if not messagebox.askyesno("候选状态", "移出候选后保留原件和记录，可随时恢复。" if archived else "恢复后需要重新核对，是否继续？", parent=self):
+        if not messagebox.askyesno("候选状态", "移出候选后保留原件和记录，可随时恢复。" if archived else "恢复候选并重新自动核验，是否继续？", parent=self):
             return
         revision, item_id = self.snapshot["revision"], item["id"]
         self.task("更新候选状态…", lambda: self.store.archive(revision, item_id, archived), preserve_edits=False)
 
-    def merge_invoice(self):
+    def change_invoice_status(self, event=None):
         item = self.selected_item()
-        if not item or not self.store or not self.allow_discard():
+        if not item or not self.store or self.busy or self.loading or not self.session_ok:
             return
-        candidates = [i for i in self.snapshot["invoices"] if i["id"] != item["id"] and not i.get("batch_id") and not i.get("archived")]
-        if not candidates:
-            messagebox.showinfo("合并同票文件", "没有可合并的其他发票记录。", parent=self)
+        status = next((key for key, label in INVOICE_STATUS.items() if label == self.invoice_status.get()), None)
+        if status is None or status == item["reimbursement_status"]:
             return
-        dialog = tk.Toplevel(self)
-        dialog.title("合并同票文件")
-        dialog.geometry("600x245")
-        dialog.transient(self)
-        dialog.grab_set()
-        ttk.Label(dialog, text="仅在确认两条记录是同一张发票时合并。\n当前记录的文件会归入所选目标，保留目标字段，随后重新核对。", wraplength=550).pack(anchor="w", padx=20, pady=18)
-        labels = [f"{i['number'] or '待填写票号'} | ¥{yuan(i['amount_cents'])} | {i['buyer_name']} | {i['id'][:6]}" for i in candidates]
-        choice = ttk.Combobox(dialog, values=labels, state="readonly", width=70)
-        choice.pack(fill="x", padx=20)
-        same = next((n for n, i in enumerate(candidates) if identity(i) == identity(item) and identity(i)), 0)
-        choice.current(same)
-        def commit():
-            target_id = candidates[choice.current()]["id"]
-            dialog.destroy()
-            revision, source_id = self.snapshot["revision"], item["id"]
-            def done(_):
-                if self.tree.exists(target_id):
-                    self.tree.selection_set(target_id)
-                    self.select_invoice()
-            self.task("合并同票文件…", lambda: self.store.merge(revision, source_id, target_id), done, preserve_edits=False)
-        ttk.Button(dialog, text="确认是同一张发票，合并", command=commit).pack(anchor="e", padx=20, pady=22)
+        if status == "reserved" and not item.get("active_batch_id"):
+            self.invoice_status.set(INVOICE_STATUS[item["reimbursement_status"]])
+            return
+        invoice_id, revision = item["id"], self.snapshot["revision"]
+        self.task("更新发票状态…", lambda: self.store.set_invoice_status(revision, invoice_id, status))
 
     def open_selection(self):
         if not self.store or self.busy or not self.allow_discard():
@@ -766,9 +860,10 @@ class Workbench(tk.Tk):
         for batch in reversed(self.snapshot.get("batches", [])):
             from datetime import datetime
             created = datetime.fromisoformat(batch["created"]).astimezone().strftime("%Y-%m-%d %H:%M")
-            self.batch_tree.insert("", "end", iid=batch["id"], values=(created, len(batch["items"]), yuan(batch["target_cents"]), yuan(batch["total_cents"]), yuan(batch["declared_cents"]), STATUS[batch["status"]]))
+            self.batch_tree.insert("", "end", iid=batch["id"], values=(created, len(batch["items"]), yuan(batch["target_cents"]), yuan(batch["total_cents"]), yuan(batch["declared_cents"])))
         if previous and self.batch_tree.exists(previous[0]):
             self.batch_tree.selection_set(previous[0])
+            self.show_batch()
 
     def selected_batch(self):
         selection = self.batch_tree.selection()
@@ -777,7 +872,14 @@ class Workbench(tk.Tk):
     def show_batch(self, event=None):
         batch = self.selected_batch()
         if batch:
-            text = f"批次：{batch['id']}\n公司：{batch['company']['name']}   税号：{batch['company']['tax_id']}\n" + "\n".join(f"{i['number']}  {i['date']}  ¥{yuan(i['amount_cents'])}" for i in batch["items"])
+            current = {i["id"]: i for i in self.snapshot["invoices"]}
+            lines = []
+            for item in batch["items"]:
+                live = current.get(item["id"], {})
+                status = INVOICE_STATUS.get(live.get("reimbursement_status"), "历史记录")
+                membership = "本批次占用" if live.get("active_batch_id") == batch["id"] else "已释放本批次占用"
+                lines.append(f"{item['number']}  {item['date']}  ¥{yuan(item['amount_cents'])}  当前：{status}（{membership}）")
+            text = f"批次：{batch['id']}\n公司：{batch['company']['name']}   税号：{batch['company']['tax_id']}\n" + "\n".join(lines)
             self.set_text(self.batch_info, text)
 
     def export_batch(self):
@@ -795,16 +897,6 @@ class Workbench(tk.Tk):
                 shutil.copy2(built, dest)
             return dest
         self.task("校验原票并生成报销材料…", work, lambda p: messagebox.showinfo("导出完成", f"已保存：\n{p}\n\n报销状态保持不变。", parent=self))
-
-    def transition_batch(self, status):
-        batch = self.selected_batch()
-        if not batch or not self.store:
-            return
-        prompt = "取消后整张发票恢复可用，历史记录仍保留。确认取消？" if status == "cancelled" else f"将批次标记为“{STATUS[status]}”？"
-        if not messagebox.askyesno("更新报销进度", prompt, parent=self):
-            return
-        revision = self.snapshot["revision"]
-        self.task("更新报销进度…", lambda: self.store.transition(revision, batch["id"], status))
 
     def close_app(self):
         if self.busy:

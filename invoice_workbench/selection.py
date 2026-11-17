@@ -6,7 +6,7 @@ from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING
 
 from .domain import UserError, money, yuan
-from .labels import state_label
+from .labels import selectable
 from .store import uid
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ class SelectionDialog(tk.Toplevel):
         self.result = None
         self.revision = owner.snapshot["revision"]
         self.request_id = uid()
-        self.candidates = [i for i in owner.snapshot["invoices"] if state_label(i) == "可用"]
+        self.candidates = [i for i in owner.snapshot["invoices"] if selectable(i)]
         self.constraints = {i["id"]: "自动" for i in self.candidates}
         self.selected_ids = []
         panel = ttk.Frame(self, padding=20)
@@ -136,7 +136,7 @@ class SelectionDialog(tk.Toplevel):
             return
         ids, target, declared = self.selected_ids[:], self.target.get(), self.declared.get()
         total = sum(i["amount_cents"] for i in self.candidates if i["id"] in ids)
-        if not messagebox.askyesno("确认整票占用", f"本次选中 {len(ids)} 张，票面合计 ¥{yuan(total)}。\n实际申报：{declared} 元。\n\n确认后整张票归属本批次，超额不结转。取消批次可释放。", parent=self):
+        if not messagebox.askyesno("确认整票占用", f"本次选中 {len(ids)} 张，票面合计 ¥{yuan(total)}。\n实际申报：{declared} 元。\n\n确认后整张票归属本批次，超额不结转。可在发票详情中修改状态；已退回或可用会释放该票。", parent=self):
             return
         revision, request_id, store, owner = self.revision, self.request_id, self.owner.store, self.owner
         self.destroy()
@@ -144,5 +144,5 @@ class SelectionDialog(tk.Toplevel):
             owner.pages.select(1)
             owner.batch_tree.selection_set(batch_id)
             owner.show_batch()
-            owner.status_text.set("批次已确认，所选发票已整票占用。可导出材料，并按实际进度更新状态。")
+            owner.status_text.set("批次已确认，所选发票已整票占用。可导出材料，并在发票详情中更新状态。")
         owner.task("确认报销批次…", lambda: store.create_batch(revision, ids, target, declared, request_id), done)

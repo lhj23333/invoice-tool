@@ -153,6 +153,15 @@ class WorkspaceReconnectTests(unittest.TestCase):
         user32.EnumThreadWindows.restype = wintypes.BOOL
         user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
         user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.EnumChildWindows.argtypes = (wintypes.HWND, callback_type, wintypes.LPARAM)
+        user32.GetDlgItem.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.GetDlgItem.restype = wintypes.HWND
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsWindowEnabled.argtypes = (wintypes.HWND,)
+        user32.IsWindowEnabled.restype = wintypes.BOOL
         user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
         user32.PostMessageW.restype = wintypes.BOOL
         main_thread = threading.get_native_id()
@@ -163,13 +172,30 @@ class WorkspaceReconnectTests(unittest.TestCase):
         def visit(window, parameter):
             caption = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(window, caption, len(caption))
-            if caption.value == title and user32.PostMessageW(window, 0x0111, response, 0):
-                answered.set()
+            if caption.value == title:
+                if response == 1:
+                    buttons = []
+                    @callback_type
+                    def find_button(child, parameter):
+                        classname = ctypes.create_unicode_buffer(128)
+                        user32.GetClassNameW(child, classname, len(classname))
+                        if classname.value == "Button" and user32.IsWindowVisible(child):
+                            buttons.append(child)
+                        return True
+                    user32.EnumChildWindows(window, find_button, 0)
+                    # 确认提示只有一个按钮，控件编号由当前 Tk/Windows 分配。
+                    button = buttons[0] if len(buttons) == 1 else None
+                else:
+                    button = user32.GetDlgItem(window, response)
+                # 按钮创建并可用后发送真实点击；窗口关闭前允许再次发送。
+                if button and user32.IsWindowVisible(button) and user32.IsWindowEnabled(button):
+                    if user32.PostMessageW(button, 0x00F5, 0, 0):
+                        answered.set()
                 return False
             return True
 
         def respond():
-            while not finished.wait(0.02) and not answered.is_set():
+            while not finished.wait(0.02):
                 user32.EnumThreadWindows(main_thread, visit, 0)
 
         worker = threading.Thread(target=respond, daemon=True)
