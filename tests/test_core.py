@@ -129,7 +129,7 @@ class StoreTests(StoreFixture, unittest.TestCase):
         self.assertEqual(report["duplicates"], 1)
         self.assertEqual(len(self.store.data["invoices"]), 1)
         self.assertEqual(len(item["files"]), 1)
-        self.assertFalse(self.store.data["invoices"][0]["reviewed"])
+        self.assertTrue(self.store.data["invoices"][0]["verification"]["passed"])
 
     def test_verified_backup_inside_library_is_a_valid_import_source(self):
         original = write_invoice(self.input)
@@ -157,8 +157,7 @@ class StoreTests(StoreFixture, unittest.TestCase):
         self.assertTrue(all(i["duplicate"] for i in self.store.view()["invoices"]))
         self.assertGreater(self.store.recommend("1.00")["shortfall_cents"], 0)
         items = list(self.store.data["invoices"])
-        self.store.merge(self.rev(), items[1]["id"], items[0]["id"])
-        review_all(self.store)
+        self.store.archive(self.rev(), items[1]["id"], True)
         self.assertEqual(self.store.recommend("500.00")["total_cents"], 60000)
 
     def test_full_invoice_occupied_and_excess_not_reused(self):
@@ -166,7 +165,7 @@ class StoreTests(StoreFixture, unittest.TestCase):
         self.assertEqual(self.store.batch(batch_id)["declared_cents"], 100000)
         self.assertEqual(self.store.batch(batch_id)["total_cents"], 100250)
         self.assertEqual(self.store.recommend("2.50")["available_cents"], 0)
-        self.store.transition(self.rev(), batch_id, "cancelled")
+        self.store.set_invoice_status(self.rev(), self.store.batch(batch_id)["items"][0]["id"], "available")
         self.assertEqual(self.store.recommend("2.50")["total_cents"], 100250)
 
     def test_export_preserves_status_and_file_hashes(self):
@@ -179,7 +178,9 @@ class StoreTests(StoreFixture, unittest.TestCase):
         with zipfile.ZipFile(first) as z:
             self.assertIn("明细.csv", z.namelist())
             self.assertTrue(z.read("明细.csv").startswith(b"\xef\xbb\xbf"))
-            copies = [n for n in z.namelist() if n.startswith("原票/")]
+            self.assertTrue(all("/" not in n and "\\" not in n for n in z.namelist()))
+            copies = [n for n in z.namelist() if n != "明细.csv"]
+            self.assertEqual(len(copies), 1)
             self.assertEqual(z.read(copies[0]), (self.input / "invoice.xml").read_bytes())
 
     def test_confirm_idempotency_and_occupied_edit_block(self):
@@ -194,15 +195,15 @@ class StoreTests(StoreFixture, unittest.TestCase):
         with self.assertRaises(UserError):
             self.store.archive(self.rev(), ids[0], True)
 
-    def test_transitions_returned_stays_occupied(self):
+    def test_invoice_return_releases_for_reuse(self):
         batch_id = self.make_batch()
-        self.store.transition(self.rev(), batch_id, "submitted")
-        self.store.transition(self.rev(), batch_id, "returned")
-        self.assertTrue(self.store.occupied())
-        self.store.transition(self.rev(), batch_id, "submitted")
-        self.store.transition(self.rev(), batch_id, "reimbursed")
-        with self.assertRaises(UserError):
-            self.store.transition(self.rev(), batch_id, "cancelled")
+        invoice_id = self.store.batch(batch_id)["items"][0]["id"]
+        self.store.set_invoice_status(self.rev(), invoice_id, "submitted")
+        self.store.set_invoice_status(self.rev(), invoice_id, "returned")
+        self.assertFalse(self.store.occupied())
+        self.assertEqual(self.store.recommend("1")["total_cents"], 60000)
+        self.store.set_invoice_status(self.rev(), invoice_id, "reimbursed")
+        self.assertEqual(self.store.recommend("1")["available_cents"], 0)
 
     def test_stale_revision_is_rejected_without_partial_change(self):
         before = deepcopy(self.store.data)
@@ -224,13 +225,14 @@ class StoreTests(StoreFixture, unittest.TestCase):
         with self.assertRaises(UserError):
             self.store.export(batch_id)
 
-    def test_archive_restore_requires_review(self):
+    def test_archive_restore_automatically_verifies(self):
         item = self.import_one()
         review_all(self.store)
         self.store.archive(self.rev(), item["id"], True)
         self.assertEqual(self.store.recommend("1")["available_cents"], 0)
         self.store.archive(self.rev(), item["id"], False)
-        self.assertFalse(self.store.invoice(item["id"])["reviewed"])
+        self.assertTrue(self.store.invoice(item["id"])["verification"]["passed"])
+        self.assertEqual(self.store.recommend("1")["total_cents"], 60000)
 
     def test_eml_attachment_import(self):
         message = EmailMessage()

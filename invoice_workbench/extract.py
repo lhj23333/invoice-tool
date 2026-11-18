@@ -2,18 +2,29 @@ from __future__ import annotations
 
 from email import policy
 from email.parser import BytesParser
+from io import BytesIO
 from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
+
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 from .domain import UserError, money
 
 SUPPORTED = {".pdf", ".xml", ".png", ".jpg", ".jpeg", ".ofd"}
 MAX_BYTES = 20 * 1024 * 1024
+MULTIPLE_INVOICE_IDENTIFIERS_WARNING = "原件包含多个不同发票号码或代码，无法自动核验；请将每张发票分别保存后重新导入。"
+
+
+def check_invoice_identifiers(result, numbers, codes):
+    if len(set(numbers)) > 1 or (any(len(number) == 8 for number in numbers) and len(set(codes)) > 1):
+        result["multiple_invoice_identifiers"] = True
+        result["warnings"].append(MULTIPLE_INVOICE_IDENTIFIERS_WARNING)
 
 
 def from_text(text: str) -> dict:
-    # PDF layout is heuristic; every new invoice requires an explicit human review.
+    # 提取结果由自动核验流程与存储字段逐项比较。
     text = text.replace("\u3000", " ").replace("：", ":")
     result = {"raw_text": text[:30000], "method": "PDF 文字提取", "warnings": []}
 
@@ -21,8 +32,11 @@ def from_text(text: str) -> dict:
         match = re.search(pattern, source, re.I)
         return match.group(1).strip() if match else ""
 
-    result["number"] = first(r"(?:发\s*票\s*号\s*码|Invoice\s*(?:No\.?|Number))\s*:?\s*(\d{20}|\d{8})(?!\d)")
-    result["code"] = first(r"(?:发\s*票\s*代\s*码|Invoice\s*Code)\s*:?\s*(\d{10,12})(?!\d)")
+    number_pattern = r"(?:发\s*票\s*号\s*码|Invoice\s*(?:No\.?|Number))\s*:?\s*(\d{20}|\d{8})(?!\d)"
+    code_pattern = r"(?:发\s*票\s*代\s*码|Invoice\s*Code)\s*:?\s*(\d{10,12})(?!\d)"
+    result["number"] = first(number_pattern)
+    result["code"] = first(code_pattern)
+    check_invoice_identifiers(result, re.findall(number_pattern, text, re.I), re.findall(code_pattern, text, re.I))
     dt = first(r"(?:开\s*票\s*日\s*期|Invoice\s*Date)\s*:?\s*(\d{4}\s*[年/-]\s*\d{1,2}\s*[月/-]\s*\d{1,2})")
     if dt:
         parts = re.findall(r"\d+", dt)
@@ -93,15 +107,21 @@ def from_xml(data: bytes) -> dict:
 
     result = {"method": "XML 字段提取", "warnings": [],
               "raw_text": "\n".join(f"{tag(e)}: {e.text.strip()}" for e in root.iter() if e.text and e.text.strip())[:30000]}
-    for field, names in {
+    aliases = {
         "number": ["InvoiceNumber", "InvoiceNo", "DigitalInvoiceNo", "Fphm", "发票号码"],
         "code": ["InvoiceCode", "Fpdm", "发票代码"],
         "date": ["IssueDate", "InvoiceDate", "Kprq", "开票日期"],
         "buyer_name": ["BuyerName", "PurchaserName", "Gfmc", "购买方名称"],
         "buyer_tax_id": ["BuyerTaxID", "BuyerTaxNo", "PurchaserTaxID", "Gfsh", "购买方纳税人识别号"],
         "seller_name": ["SellerName", "Xfmc", "销售方名称"],
-    }.items():
+    }
+    for field, names in aliases.items():
         result[field] = find(root, names)
+    identifiers = {}
+    for field in ("number", "code"):
+        names = {name.lower() for name in aliases[field]}
+        identifiers[field] = [e.text.strip() for e in root.iter() if tag(e) in names and e.text and e.text.strip()]
+    check_invoice_identifiers(result, identifiers["number"], identifiers["code"])
     for node in root.iter():
         if tag(node) in {"buyer", "buyerinformation", "purchaser", "purchaserinformation"}:
             result["buyer_name"] = result["buyer_name"] or find(node, ["Name"])
@@ -132,8 +152,6 @@ def extract(data: bytes, suffix: str) -> dict:
         if not data.startswith(b"%PDF-"):
             raise UserError("文件内容不是有效的 PDF。")
         try:
-            from io import BytesIO
-            from pypdf import PdfReader
             reader = PdfReader(BytesIO(data))
             if reader.is_encrypted and not reader.decrypt(""):
                 raise UserError("PDF 已加密，请解密后导入。")
@@ -147,18 +165,16 @@ def extract(data: bytes, suffix: str) -> dict:
                 parts.append(page.extract_text(extraction_mode="layout") or "")
             result = from_text("\n".join(parts))
             if not result["raw_text"].strip():
-                result["warnings"].append("未发现 PDF 文字层；当前版本未接入 OCR，请人工填写。")
+                result["warnings"].append("未发现 PDF 文字层；当前未接入 OCR，无法自动核验。")
             return result
-        except ImportError:
-            return {"method": "仅保存原件", "warnings": ["PDF 提取依赖未安装；请运行 setup.ps1。"], "raw_text": ""}
-        except UserError:
-            raise
-        except Exception:
-            return {"method": "仅保存原件", "warnings": ["PDF 无法自动提取，已保留原件供人工核对。"], "raw_text": ""}
+        except NotImplementedError as exc:
+            raise UserError(f"PDF 使用了暂不支持的加密或内容处理方式，请解密或重新另存后导入：{exc}") from exc
+        except PdfReadError as exc:
+            raise UserError(f"PDF 无法读取：{exc}") from exc
     signatures = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff", ".ofd": b"PK"}
     if suffix not in signatures or not data.startswith(signatures[suffix]):
         raise UserError("文件格式与扩展名不匹配，或格式暂不支持。")
-    return {"method": "仅保存原件", "warnings": ["图片 / OFD 当前仅保存和人工核对；OCR 将在真实样本验证后接入。"], "raw_text": ""}
+    return {"method": "仅保存原件", "warnings": ["图片 / OFD 当前仅保存原件，无法自动核验。"], "raw_text": ""}
 
 
 def eml_attachments(data: bytes) -> tuple[list[tuple[str, bytes]], list[str]]:
