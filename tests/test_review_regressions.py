@@ -103,18 +103,22 @@ class VerificationInputTests(StoreFixture, unittest.TestCase):
         super().setUp()
         self.store.set_company(self.rev(), "Example Company", TAX)
 
-    def test_combined_pdf_cannot_be_used_alongside_its_individual_invoice(self):
+    def test_combined_pdf_imported_first_does_not_block_its_first_invoice(self):
         a, b = "26000000000000000001", "26000000000000000002"
         combined = self.input / "combined.pdf"
         combined.write_bytes(pdf_document([invoice_text(a), invoice_text(b)]))
-        (self.input / "individual.pdf").write_bytes(pdf_document([invoice_text(b)]))
-        before = {p.name: fingerprint(p.read_bytes()) for p in self.input.iterdir()}
         self.store.import_folder(self.rev(), str(self.input))
+        (self.input / "individual.pdf").write_bytes(pdf_document([invoice_text(a)]))
+        before = {p.name: fingerprint(p.read_bytes()) for p in self.input.iterdir()}
+        result = self.store.import_folder(self.rev(), str(self.input))
+        self.assertEqual((result["imported"], result["merged"], result["duplicates"]), (1, 0, 1))
         item = next(i for i in self.store.data["invoices"] if i["files"][0]["name"] == "combined.pdf")
         self.assertFalse(item["verification"]["passed"])
         self.assertTrue(any("多个" in issue for issue in item["verification"]["issues"]))
-        standalone = next(i for i in self.store.data["invoices"] if i["number"] == b)
+        standalone = next(i for i in self.store.data["invoices"] if i["files"][0]["name"] == "individual.pdf")
+        self.assertEqual(standalone["number"], a)
         self.assertTrue(standalone["verification"]["passed"])
+        self.assertEqual(self.store.duplicate_ids(), set())
         self.assertEqual(self.store.recommend("500")["ids"], [standalone["id"]])
         self.store.create_batch(self.rev(), [standalone["id"]], "500", "500", uuid.uuid4().hex)
         with self.assertRaises(UserError):
@@ -149,6 +153,50 @@ class VerificationInputTests(StoreFixture, unittest.TestCase):
         self.assertFalse(item["verification"]["passed"])
         self.assertTrue(any("多个" in issue for issue in item["verification"]["issues"]))
 
+    def test_combined_xml_imported_later_does_not_change_verified_invoice(self):
+        standalone = write_invoice(self.input, buyer="Example Company")
+        self.store.import_folder(self.rev(), str(self.input))
+        original = deepcopy(self.store.data["invoices"][0])
+        combined = write_invoice(self.input, "combined.xml", buyer="Example Company",
+                                 extra="<InvoiceNumber>26000000000000000002</InvoiceNumber>")
+        before = {path: fingerprint(path.read_bytes()) for path in (standalone, combined)}
+        result = self.store.import_folder(self.rev(), str(self.input))
+        self.assertEqual((result["imported"], result["merged"], result["duplicates"]), (1, 0, 1))
+        root = self.store.root
+        self.store.close()
+        self.store = Store(root)
+        repeat = self.store.import_folder(self.rev(), str(self.input))
+        self.assertEqual((repeat["imported"], repeat["merged"], repeat["duplicates"]), (0, 0, 2))
+        self.assertEqual(self.store.invoice(original["id"]), original)
+        other = next(i for i in self.store.data["invoices"] if i["id"] != original["id"])
+        self.assertEqual(len(other["files"]), 1)
+        self.assertEqual(self.store.original(other["files"][0]).read_bytes(), combined.read_bytes())
+        self.store.review(self.rev(), other["id"], {**other, "amount": "600.00", "note": "含多张发票"})
+        saved = self.store.invoice(other["id"])
+        self.assertEqual(saved["note"], "含多张发票")
+        self.assertFalse(saved["verification"]["passed"])
+        self.assertEqual(self.store.duplicate_ids(), set())
+        self.assertEqual(self.store.recommend("500")["ids"], [original["id"]])
+        self.assertEqual({path: fingerprint(path.read_bytes()) for path in before}, before)
+
+    def test_legacy_single_file_record_with_multiple_invoice_codes_stays_separate(self):
+        legacy_code = "<InvoiceCode>1234567890</InvoiceCode>"
+        write_invoice(self.input, "combined.xml", number="12345678", buyer="Example Company",
+                      extra=legacy_code + "<InvoiceCode>0987654321</InvoiceCode>")
+        self.store.import_folder(self.rev(), str(self.input))
+        with self.store.change(self.rev()):
+            self.store.data["invoices"][0].pop("multiple_invoice_identifiers")
+        root = self.store.root
+        self.store.close()
+        self.store = Store(root)
+        write_invoice(self.input, number="12345678", buyer="Example Company", extra=legacy_code)
+        result = self.store.import_folder(self.rev(), str(self.input))
+        self.assertEqual((result["imported"], result["merged"], result["duplicates"]), (1, 0, 1))
+        ambiguous, standalone = self.store.data["invoices"]
+        self.assertFalse(ambiguous["verification"]["passed"])
+        self.assertTrue(standalone["verification"]["passed"])
+        self.assertEqual(self.store.duplicate_ids(), set())
+        self.assertEqual(self.store.recommend("500")["ids"], [standalone["id"]])
 
     def test_unsupported_pdf_is_reported_without_discarding_other_imports(self):
         payload = unsupported_encryption_pdf()

@@ -17,7 +17,7 @@ import uuid
 import zipfile
 
 from .domain import UserError, choose_invoices, company_matches, identity, money, validate_invoice, yuan
-from .extract import MAX_BYTES, SUPPORTED, eml_attachments, extract
+from .extract import MAX_BYTES, MULTIPLE_INVOICE_IDENTIFIERS_WARNING, SUPPORTED, eml_attachments, extract
 from .filesystem import check_delete_access, is_directory_link
 from .session import WriterGuard, process_running
 from .verification import FIELDS, comparable, verify_record
@@ -45,6 +45,15 @@ def safe_name(name: str) -> str:
 def csv_cell(value) -> str:
     text = str(value)
     return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r")) else text
+
+
+def _record_identity(item: dict) -> str | None:
+    # 旧索引中的单文件记录可能只有提取警告，仍可据此识别多票原件。
+    if item.get("multiple_invoice_identifiers") or (
+        len(item["files"]) == 1 and MULTIPLE_INVOICE_IDENTIFIERS_WARNING in item.get("warnings", ())
+    ):
+        return None
+    return identity(item)
 
 
 class Store:
@@ -314,8 +323,11 @@ class Store:
                "seller_name": "", "amount_cents": 0, "note": "", "reviewed": False, "archived": False, "created": now(),
                "files": [], "sources": [source], **extracted}
         new.update(reimbursement_status="available", active_batch_id=None, status_events=[])
-        key = identity(new)
-        target = next((i for i in self.data["invoices"] if key and identity(i) == key and self._protects_identity(i)), None)
+        key = _record_identity(new)
+        target = None
+        if key:
+            target = next((i for i in self.data["invoices"]
+                           if self._protects_identity(i) and _record_identity(i) == key), None)
         conflicts = []
         if target:
             conflicts = [k for k in FIELDS
@@ -410,8 +422,9 @@ class Store:
             item = self.invoice(invoice_id)
             if item.get("reimbursement_status") in OCCUPIED_STATUSES:
                 raise UserError("该票已选入批次、已提交或已报销，无法修改字段。请在发票详情中将状态改为已退回或可用。")
-            duplicates = [i for i in self.data["invoices"] if i["id"] != invoice_id and self._protects_identity(i) and identity(i) == identity(cleaned)]
-            if duplicates:
+            key = _record_identity({**item, **cleaned})
+            if key and any(i["id"] != invoice_id and self._protects_identity(i) and _record_identity(i) == key
+                           for i in self.data["invoices"]):
                 raise UserError("存在同号码与代码的发票，请修正错误票号或移出错误记录。")
             item.update(cleaned)
             self._verify(item)
@@ -427,7 +440,7 @@ class Store:
     def duplicate_ids(self) -> set[str]:
         groups = {}
         for item in self.data["invoices"]:
-            key = identity(item)
+            key = _record_identity(item)
             if key and self._protects_identity(item):
                 groups.setdefault(key, []).append(item["id"])
         return {i for group in groups.values() if len(group) > 1 for i in group}

@@ -14,11 +14,13 @@ from .domain import UserError, money
 
 SUPPORTED = {".pdf", ".xml", ".png", ".jpg", ".jpeg", ".ofd"}
 MAX_BYTES = 20 * 1024 * 1024
+MULTIPLE_INVOICE_IDENTIFIERS_WARNING = "原件包含多个不同发票号码或代码，无法自动核验；请将每张发票分别保存后重新导入。"
 
 
 def check_invoice_identifiers(result, numbers, codes):
     if len(set(numbers)) > 1 or (any(len(number) == 8 for number in numbers) and len(set(codes)) > 1):
-        result["warnings"].append("原件包含多个不同发票号码或代码，无法自动核验；请将每张发票分别保存后重新导入。")
+        result["multiple_invoice_identifiers"] = True
+        result["warnings"].append(MULTIPLE_INVOICE_IDENTIFIERS_WARNING)
 
 
 def from_text(text: str) -> dict:
