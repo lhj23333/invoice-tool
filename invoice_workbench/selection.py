@@ -100,6 +100,9 @@ class SelectionDialog(tk.Toplevel):
         self.reset_button = ttk.Button(tools, text="重置全部约束为自动", style="Quiet.TButton", command=self.reset_constraints)
         self.reset_button.grid(row=0, column=2, sticky="e")
         ttk.Label(tools, text=f"可用发票 {len(self.candidates)} 张", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        company = owner.snapshot["company"]
+        ttk.Label(tools, text=f"报销公司  {company['name'] or company['tax_id']}", style="Muted.TLabel", width=1).grid(
+            row=0, column=1, sticky="ew", padx=(small, small))
         self.interaction_hint = ttk.Label(tools, text="点击复选框微调 · 点击约束列切换 · 右键指定",
                                           style="Hint.TLabel", width=1)
         self.interaction_hint.grid(row=1, column=0, columnspan=3, sticky="ew")

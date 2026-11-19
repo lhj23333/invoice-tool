@@ -75,21 +75,27 @@ def company_matches(invoice: dict, company: dict) -> bool:
     return True
 
 
+def eligible_invoice(item, *, company_match, duplicate):
+    return (item.get("verification", {}).get("passed", False) and not item.get("archived")
+            and not duplicate and company_match and item.get("reimbursement_status") in {"available", "returned"})
+
+
 def choose_invoices(invoices: list[dict], target: int, force_ids: list[str] | None = None,
                     exclude_ids: list[str] | None = None) -> dict:
     """Exact subset sum with integer cents, gcd compression and a memory budget."""
     if target <= 0 or any(i.get("amount_cents", 0) <= 0 for i in invoices):
         raise UserError("目标金额与候选发票金额必须大于零。")
-    if len({i["id"] for i in invoices}) != len(invoices):
+    candidate_ids = {i["id"] for i in invoices}
+    if len(candidate_ids) != len(invoices):
         raise UserError("候选发票不能重复。")
     forced, excluded = set(force_ids or []), set(exclude_ids or [])
-    by_id = {i["id"]: i for i in invoices}
     if forced & excluded:
         raise UserError("同一张票不能同时必选和排除。")
-    if not forced <= by_id.keys():
+    if not forced <= candidate_ids:
         raise UserError("必选发票已不可用，请刷新后重试。")
     base = [i for i in invoices if i["id"] in forced]
-    rest = sorted((i for i in invoices if i["id"] not in forced | excluded),
+    omitted = forced | excluded
+    rest = sorted((i for i in invoices if i["id"] not in omitted),
                   key=lambda i: (i.get("date", ""), i["id"]))
     base_total = sum(i["amount_cents"] for i in base)
     available = base_total + sum(i["amount_cents"] for i in rest)
@@ -101,7 +107,7 @@ def choose_invoices(invoices: list[dict], target: int, force_ids: list[str] | No
     if need > 0:
         unit = reduce(gcd, (i["amount_cents"] for i in rest))
         scaled_need = (need + unit - 1) // unit
-        # A feasible upper bound is enough; sums above it cannot improve the answer.
+        # 任何可行组合都可以作为上界，更高的组合金额无需计算。
         running = 0
         for i in sorted(rest, key=lambda i: i["amount_cents"]):
             running += i["amount_cents"] // unit

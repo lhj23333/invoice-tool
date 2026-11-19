@@ -1,10 +1,11 @@
+from .domain import eligible_invoice
+
+
 INVOICE_STATUS = {"available": "可用", "reserved": "已选入批次", "submitted": "已提交", "reimbursed": "已报销", "returned": "已退回"}
 
 
 def selectable(item):
-    return (item.get("verification", {}).get("passed", False) and not item.get("archived")
-            and not item.get("duplicate") and item.get("company_match")
-            and item.get("reimbursement_status") in {"available", "returned"})
+    return eligible_invoice(item, company_match=item.get("company_match", False), duplicate=item.get("duplicate", False))
 
 
 def state_label(item: dict) -> str:

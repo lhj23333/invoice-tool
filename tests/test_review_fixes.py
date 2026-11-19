@@ -1,3 +1,4 @@
+from contextlib import closing
 import ctypes
 from ctypes import wintypes
 from email.message import EmailMessage
@@ -11,12 +12,14 @@ import sys
 import tempfile
 import threading
 import unittest
+from uuid import uuid4
 
 from invoice_workbench.domain import UserError
 from invoice_workbench.extract import extract, from_text
 from invoice_workbench.gui import Workbench
+from invoice_workbench.outlook_auth import CLIENT_ID_ENV
 from invoice_workbench.store import Store
-from .helpers import xml_invoice
+from .helpers import BUYER, TAX, xml_invoice
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -97,7 +100,7 @@ class XmlEncodingTests(unittest.TestCase):
                         self.assertIn("z-invalid.xml", result["errors"][0]["file"])
                         self.assertIn("XML 编码无法解析", result["errors"][0]["error"])
                         self.assertEqual({item["amount_cents"] for item in store.data["invoices"]}, {60000, 40250})
-                        self.assertEqual(len(list((store.root / "objects").iterdir())), 2)
+                        self.assertEqual(len(list((store.root / "objects").iterdir())), 0 if email else 2)
                     finally:
                         store.close()
                     reopened = Store(root / "workspace")
@@ -123,12 +126,27 @@ class BuildInputTests(unittest.TestCase):
                         shutil.copy2(ROOT / name, root / name)
                 output = root / "dist" / "bundle"
                 result = subprocess.run([sys.executable, "-B", str(root / "tools" / "build_portable.py"),
-                                         "--output", str(output)], capture_output=True, timeout=30,
+                                         "--output", str(output), "--outlook-client-id", str(uuid4())], capture_output=True, timeout=30,
                                         env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1"))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("构建缺少必需".encode(), result.stderr)
                 self.assertIn(missing.encode(), result.stderr)
                 self.assertFalse((root / "dist").exists())
+
+    def test_missing_outlook_client_id_fails_before_creating_output(self):
+        TEST_ROOT.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
+            root = Path(directory)
+            shutil.copytree(ROOT / "invoice_workbench", root / "invoice_workbench", ignore=shutil.ignore_patterns("__pycache__"))
+            (root / "tools").mkdir()
+            build = root / "tools" / "build_portable.py"
+            shutil.copy2(ROOT / "tools" / build.name, build)
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            env.pop(CLIENT_ID_ENV, None)
+            result = subprocess.run([sys.executable, "-B", str(build)], capture_output=True, timeout=30, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("发布构建需要 Outlook OAuth 客户端 ID".encode(), result.stderr)
+            self.assertFalse((root / "dist").exists())
 
 
 @unittest.skipUnless(sys.platform == "win32", "需要 Windows 原生消息框")
@@ -275,6 +293,58 @@ class WorkspaceReconnectTests(unittest.TestCase):
         self.assertEqual(app.connection_directory, requested)
         self.assertEqual(app.store.root, requested)
         self.assert_saved_workspace_unchanged()
+
+    def test_legacy_app_settings_open_and_recover_the_same_custom_workspace(self):
+        application = self.root / "app"
+        application.mkdir()
+        shutil.copytree(ROOT / "invoice_workbench", application / "invoice_workbench",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy2(self.settings_file, application / "local-settings.json")
+        invoice = self.root / "invoice"
+        invoice.mkdir()
+        (invoice / "original.xml").write_bytes(xml_invoice())
+        with closing(Store(self.saved)) as store:
+            store.set_company(store.view()["revision"], BUYER, TAX)
+            report = store.import_folder(store.view()["revision"], str(invoice))
+            invoice_id = report["items"][0]["invoice_id"]
+            store.create_batch(store.view()["revision"], [invoice_id], "500", "500", uuid4().hex)
+            store.set_invoice_status(store.view()["revision"], invoice_id, "reimbursed")
+        before = (self.saved / "invoices.json").read_bytes()
+        script = '''
+import json
+from pathlib import Path
+import sys
+import unittest
+
+from invoice_workbench.gui import Workbench
+sys.path.append(sys.argv[1])
+from tests.test_review_fixes import WorkspaceReconnectTests
+
+workspace = Path(sys.argv[2])
+def verify(app):
+    try:
+        assert app.store.root == workspace
+        assert len(app.snapshot["batches"]) == 1
+        invoice, = app.snapshot["invoices"]
+        assert invoice["reimbursement_status"] == "reimbursed"
+    finally:
+        app.close_app()
+
+verify(Workbench())
+(Path("data") / "local-settings.json").unlink()
+marker = workspace / ".invoice-session.json"
+marker.write_text(json.dumps({"session": "legacy", "host": "remote-test", "pid": 1}), encoding="utf-8")
+answer = WorkspaceReconnectTests.answer_dialog
+verify(answer(unittest.TestCase(), lambda: Workbench(recover_lock=True), "恢复遗留会话", 6))
+assert len(list(workspace.glob("recovered-session-*.json"))) == 1
+assert not (Path("data") / "invoices.json").exists()
+Path("local-settings.json").unlink()
+verify(Workbench())
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", script, str(ROOT), str(self.saved)], cwd=application,
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual((self.saved / "invoices.json").read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from unittest.mock import patch
 from invoice_workbench.domain import UserError
 from invoice_workbench.gui import Workbench
 from invoice_workbench.selection import SelectionDialog
-from .helpers import BUYER, TAX, StoreFixture, review_all, write_invoice
+from .helpers import BUYER, TAX, StoreFixture, write_invoice
 
 
 class OriginalRecoveryTests(StoreFixture, unittest.TestCase):
@@ -63,7 +63,6 @@ class DraftAndSelectionTests(unittest.TestCase):
         store = self.app.store
         store.import_folder(store.data["revision"], str(source))
         store.set_company(store.data["revision"], BUYER, TAX)
-        review_all(store)
         self.app.reload()
         self.app.load_invoice(self.app.snapshot["invoices"][0])
 

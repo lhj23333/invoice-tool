@@ -4,6 +4,8 @@ __pycache__/
 /.venv/
 /.deps/
 /runtime/
+/runtime-ofd/
+/outlook-oauth-client-id.txt
 
 # Build products are distributed separately from source
 /dist/

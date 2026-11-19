@@ -17,7 +17,9 @@ from . import test_review_fixes
 class ResetStoreTests(StoreFixture, unittest.TestCase):
     def test_reset_clears_managed_data_and_keeps_sources_and_session(self):
         batch_id = self.make_batch()
-        self.store.export(batch_id)
+        export = self.store.export(batch_id)
+        export_bytes = export.read_bytes()
+        managed = self.store.original(self.store.batch(batch_id)["items"][0]["files"][0])
         original = (self.input / "invoice.xml").read_bytes()
         unrelated = self.store.root / "notes" / "keep.txt"
         unrelated.parent.mkdir()
@@ -30,8 +32,9 @@ class ResetStoreTests(StoreFixture, unittest.TestCase):
         self.assertEqual(snapshot["batches"], [])
         self.assertEqual(snapshot["company"], {"name": "", "tax_id": ""})
         self.assertGreater(snapshot["revision"], revision)
-        for name in ("objects", "history", "exports"):
-            self.assertEqual(list((self.store.root / name).iterdir()), [])
+        self.assertEqual(list((self.store.root / "history").iterdir()), [])
+        self.assertEqual(managed.read_bytes(), original)
+        self.assertEqual(export.read_bytes(), export_bytes)
         self.assertEqual(self.store.lock_path.read_bytes(), session)
         self.assertEqual(unrelated.read_text(encoding="utf-8"), "用户保留的资料")
         self.assertEqual((self.input / "invoice.xml").read_bytes(), original)
@@ -67,24 +70,27 @@ class ResetStoreTests(StoreFixture, unittest.TestCase):
         self.assertTrue(all(p.exists() for p in objects))
 
     @unittest.skipUnless(os.name == "nt", "需要 Windows 文件共享权限")
-    def test_locked_original_stops_reset_before_index_changes(self):
+    def test_locked_history_stops_reset_before_index_changes(self):
         item = self.import_one()
         original = self.store.original(item["files"][0])
+        history = next((self.store.root / "history").glob("*.json"))
         before = self.store.state_path.read_bytes()
-        with original.open("rb") as held:
+        original_bytes = original.read_bytes()
+        with history.open("rb") as held:
             with self.assertRaisesRegex(UserError, "文件被占用"):
                 self.store.reset(self.rev())
             self.assertEqual(self.store.state_path.read_bytes(), before)
-            self.assertEqual(held.read(), original.read_bytes())
+            self.assertTrue(held.read())
         self.store.reset(self.rev())
         self.assertEqual(self.store.view()["invoices"], [])
+        self.assertEqual(original.read_bytes(), original_bytes)
 
     @unittest.skipUnless(os.name == "nt", "需要 Windows junction")
     def test_linked_managed_directory_stops_reset_without_deleting_target(self):
         self.import_one()
         before = self.store.state_path.read_bytes()
-        original = self.store.root / "objects"
-        moved = self.root / "saved-objects"
+        original = self.store.root / "history"
+        moved = self.root / "saved-history"
         original.rename(moved)
         subprocess.run(["cmd", "/c", "mklink", "/J", str(original), str(moved)], check=True, capture_output=True)
         files = {p.name: p.read_bytes() for p in moved.iterdir()}
@@ -97,8 +103,9 @@ class ResetStoreTests(StoreFixture, unittest.TestCase):
     def test_nested_junction_stops_reset_before_scanning_target(self):
         self.import_one()
         before = self.store.state_path.read_bytes()
-        junction = self.store.root / "objects" / "cycle"
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(self.store.root / "objects")], check=True, capture_output=True)
+        history = self.store.root / "history"
+        junction = history / "cycle"
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(history)], check=True, capture_output=True)
         with self.assertRaisesRegex(UserError, "内部存在链接"):
             self.store.reset(self.rev())
         self.assertEqual(self.store.state_path.read_bytes(), before)

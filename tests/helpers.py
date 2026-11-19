@@ -24,12 +24,6 @@ def write_invoice(folder: Path, name="invoice.xml", **fields):
     return path
 
 
-def review_all(store):
-    for item in list(store.data["invoices"]):
-        fields = {**item, "amount": f"{item['amount_cents'] / 100:.2f}"}
-        store.review(store.data["revision"], item["id"], fields)
-
-
 class StoreFixture:
     """Shared isolated workspace setup and helpers, without test cases."""
     def setUp(self):
@@ -53,8 +47,6 @@ class StoreFixture:
         return self.store.data["invoices"][0]
 
     def make_batch(self, amount="600.00", target="500.00"):
-        self.import_one(amount=amount)
-        review_all(self.store)
-        ids = [i["id"] for i in self.store.data["invoices"]]
-        return self.store.create_batch(self.rev(), ids, target, target, uuid.uuid4().hex)
+        item = self.import_one(amount=amount)
+        return self.store.create_batch(self.rev(), [item["id"]], target, target, uuid.uuid4().hex)
 

@@ -6,11 +6,10 @@ import unittest
 import uuid
 import zipfile
 
-from tools.backup import file_hash, verified_backup
 from invoice_workbench.domain import UserError, choose_invoices, company_matches, identity, money, validate_invoice, yuan
 from invoice_workbench.extract import extract, from_text
 from invoice_workbench.store import Store, csv_cell
-from .helpers import BUYER, TAX, StoreFixture, review_all, write_invoice, xml_invoice
+from .helpers import BUYER, TAX, StoreFixture, write_invoice, xml_invoice
 
 
 class MoneyAndSolver(unittest.TestCase):
@@ -131,15 +130,6 @@ class StoreTests(StoreFixture, unittest.TestCase):
         self.assertEqual(len(item["files"]), 1)
         self.assertTrue(self.store.data["invoices"][0]["verification"]["passed"])
 
-    def test_verified_backup_inside_library_is_a_valid_import_source(self):
-        original = write_invoice(self.input)
-        before = file_hash(original)
-        backup = verified_backup(self.input, self.store.root / "backups")
-        report = self.store.import_folder(self.rev(), backup["files_directory"], recursive=True)
-        self.assertEqual(report["imported"], 1)
-        self.assertEqual(file_hash(original), before)
-        self.assertEqual(self.store.data["invoices"][0]["amount_cents"], 60000)
-
     def test_same_invoice_different_files_merge(self):
         self.import_one()
         write_invoice(self.input, "variant.xml", extra="<Format>second-file</Format>")
@@ -150,7 +140,6 @@ class StoreTests(StoreFixture, unittest.TestCase):
 
     def test_conflicting_duplicate_blocks_selection(self):
         self.import_one()
-        review_all(self.store)
         write_invoice(self.input, "conflict.xml", amount="601.00")
         self.store.import_folder(self.rev(), str(self.input))
         self.assertEqual(len(self.store.data["invoices"]), 2)
@@ -185,7 +174,6 @@ class StoreTests(StoreFixture, unittest.TestCase):
 
     def test_confirm_idempotency_and_occupied_edit_block(self):
         self.import_one()
-        review_all(self.store)
         ids = [i["id"] for i in self.store.data["invoices"]]
         request_id, old_rev = uuid.uuid4().hex, self.rev()
         batch_id = self.store.create_batch(old_rev, ids, "500", "500", request_id)
@@ -227,7 +215,6 @@ class StoreTests(StoreFixture, unittest.TestCase):
 
     def test_archive_restore_automatically_verifies(self):
         item = self.import_one()
-        review_all(self.store)
         self.store.archive(self.rev(), item["id"], True)
         self.assertEqual(self.store.recommend("1")["available_cents"], 0)
         self.store.archive(self.rev(), item["id"], False)
@@ -242,6 +229,11 @@ class StoreTests(StoreFixture, unittest.TestCase):
         (self.input / "sample.eml").write_bytes(message.as_bytes())
         report = self.store.import_folder(self.rev(), str(self.input))
         self.assertEqual(report["imported"], 1)
+        item, = self.store.view()["invoices"]
+        self.assertEqual(item["files"], [])
+        self.assertEqual(item["mail_xml"][0]["fields"]["amount_cents"], 60000)
+        self.assertFalse(item["verification"]["passed"])
+        self.assertFalse(list((self.store.root / "objects").iterdir()))
 
     def test_persistence_and_snapshot(self):
         batch_id = self.make_batch()

@@ -49,9 +49,6 @@ class SegmentedPages(ttk.Frame):
         self.variable.set(self.labels[index])
         self._changed()
 
-    def index(self, value):
-        return self.current_index if value == "current" else self.labels.index(value)
-
     def _changed(self):
         index = self.labels.index(self.variable.get())
         if index == self.current_index:
@@ -59,8 +56,7 @@ class SegmentedPages(ttk.Frame):
         self.frames[self.current_index].grid_remove()
         self.current_index = index
         self.frames[index].grid(row=0, column=0, sticky="nsew")
-        # 保留详情页切换事件，使预览只在需要时生成。
-        self.event_generate("<<NotebookTabChanged>>", when="tail")
+        self.event_generate("<<SegmentedPageChanged>>", when="tail")
 
 
 class ScrollableFrame(ttk.Frame):

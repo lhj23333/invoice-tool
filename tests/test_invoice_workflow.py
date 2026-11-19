@@ -77,7 +77,7 @@ class AutomaticVerificationTests(StoreFixture, unittest.TestCase):
         self.store.close()
         (root / "invoices.json").write_text(json.dumps(state), encoding="utf-8")
         self.store = Store(root)
-        self.assertEqual(self.store.data["schema"], 2)
+        self.assertEqual(self.store.data["schema"], 3)
         item = self.store.view()["invoices"][0]
         self.assertTrue(item["verification"]["passed"])
         self.assertEqual(item["reimbursement_status"], "returned")
@@ -333,7 +333,7 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertFalse(copy.exists())
         self.assertIn("已删除 1", self.app.status_text.get())
 
-    def test_status_dropdown_controls_reuse_and_obsolete_actions_are_removed(self):
+    def test_status_dropdown_releases_invoice_for_selection(self):
         source = self.root / "source"
         write_invoice(source)
         store = self.app.store
@@ -351,6 +351,3 @@ class DesktopWorkflowTests(unittest.TestCase):
         dialog = SelectionDialog(self.app)
         self.assertEqual([i["id"] for i in dialog.candidates], [invoice_id])
         dialog.destroy()
-        labels = [b.cget("text") for b in self.app.actions]
-        for obsolete in ("合并同票文件", "保存并标记已核对", "标记已提交", "标记已报销", "标记已退回", "取消并释放"):
-            self.assertNotIn(obsolete, labels)

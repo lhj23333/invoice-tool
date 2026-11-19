@@ -2,6 +2,8 @@ from pathlib import Path
 import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -72,10 +74,11 @@ class SessionTests(unittest.TestCase):
     def test_only_definitely_dead_local_process_auto_recovers(self):
         directory = self.store.root
         self.store.close()
-        marker = {"session": "old", "host": socket.gethostname(), "pid": 123456789}
+        with subprocess.Popen([sys.executable, "-B", "-c", "pass"]) as process:
+            self.assertEqual(process.wait(timeout=10), 0)
+        marker = {"session": "old", "host": socket.gethostname(), "pid": process.pid}
         (directory / ".invoice-session.json").write_text(json.dumps(marker))
-        with patch("invoice_workbench.store.process_running", return_value=False):
-            self.store = Store(directory)
+        self.store = Store(directory)
         self.assertNotEqual(self.store.lock_id, "old")
         self.assertTrue(list(directory.glob("recovered-session-*.json")))
 
@@ -84,7 +87,7 @@ class SessionTests(unittest.TestCase):
         self.store.close()
         marker = {"session": "remote", "host": "another-host", "pid": 999999}
         (directory / ".invoice-session.json").write_text(json.dumps(marker))
-        with patch("invoice_workbench.store.process_running", return_value=False), self.assertRaises(UserError):
+        with self.assertRaises(UserError):
             Store(directory)
         self.assertEqual(json.loads((directory / ".invoice-session.json").read_text()), marker)
 
@@ -115,26 +118,20 @@ class ImportWorkflowTests(unittest.TestCase):
         self.assertFalse(app.busy, "background import did not complete")
         app.update()
 
-    def test_gui_import_is_direct_and_does_not_create_backups(self):
+    def test_gui_import_resets_filters_and_preserves_source_files(self):
         source = self.root / "source"
         invoice = write_invoice(source / "nested")
         original = invoice.read_bytes()
         initial = {p.relative_to(source) for p in source.rglob("*")}
         self.app.search.set("no match")
         self.app.filter.set("可用")
-        with patch("invoice_workbench.gui.filedialog.askdirectory", return_value=str(source)), \
-                patch("invoice_workbench.gui.messagebox.showerror") as error, \
-                patch("invoice_workbench.gui.messagebox.askokcancel") as confirmation:
-            self.app.import_directory()
-            self.wait_import()
-            error.assert_not_called()
-            confirmation.assert_not_called()
+        self.app.start_import(source)
+        self.wait_import()
         self.assertEqual(len(self.app.tree.get_children()), 1)
         self.assertEqual(self.app.stats[0].get(), "1")
         self.assertIn("新增 1", self.app.status_text.get())
         self.assertEqual(self.app.filter.get(), "全部")
         self.assertEqual(self.app.search.get(), "")
-        self.assertFalse((self.app.store.root / "backups").exists())
         self.assertEqual(initial, {p.relative_to(source) for p in source.rglob("*")})
         self.assertEqual(invoice.read_bytes(), original)
         self.assertEqual(self.app.selected_item()["sources"], [str(invoice)])
@@ -143,7 +140,7 @@ class ImportWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.app.tree.get_children()), 1)
         self.assertIn("已有 1", self.app.status_text.get())
 
-    def test_choose_source_folder_imports_into_existing_workspace(self):
+    def test_choose_library_keeps_database_and_sets_the_local_import_directory(self):
         source = self.root / "source"
         write_invoice(source)
         workspace = self.app.store.root
@@ -151,7 +148,13 @@ class ImportWorkflowTests(unittest.TestCase):
             self.app.choose_library()
             self.wait_import()
         self.assertEqual(self.app.store.root, workspace)
+        self.assertEqual(self.app.store.library, source)
+        self.assertEqual(len(self.app.tree.get_children()), 0)
+        self.app.import_directory()
+        self.wait_import()
         self.assertEqual(len(self.app.tree.get_children()), 1)
+        file, = self.app.selected_item()["files"]
+        self.assertEqual(self.app.store.original(file), source / "invoice.xml")
         self.assertFalse((source / "invoices.json").exists())
         self.assertFalse((source / ".invoice-session.json").exists())
 
@@ -175,6 +178,8 @@ class ImportWorkflowTests(unittest.TestCase):
     def test_empty_folder_has_clear_result_without_index_write(self):
         source = self.root / "empty"
         source.mkdir()
+        self.app.store.set_library(self.app.snapshot["revision"], source)
+        self.app.reload()
         before = self.app.store.state_path.read_bytes()
         self.app.start_import(source)
         self.wait_import()

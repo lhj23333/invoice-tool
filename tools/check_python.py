@@ -25,6 +25,10 @@ def main():
         import pypdf
         from PIL import Image, ImageTk
         import pypdfium2
+        import imapclient
+        import msal
+        import onnxruntime
+        import rapidocr
 
     result = {"executable": sys.executable, "prefix": sys.prefix, "base_prefix": sys.base_prefix,
               "version": list(sys.version_info[:2]), "platform": sysconfig.get_platform()}

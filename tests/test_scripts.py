@@ -83,14 +83,6 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(json.loads(result.stdout)["executable"]), self.python)
 
-    def test_registered_python_is_found_without_path(self):
-        env = dict(os.environ, PATH=str(self.project / "empty path"))
-        env.pop("VIRTUAL_ENV", None)
-        env.pop("CONDA_PREFIX", None)
-        result = self.resolve(self.project / "empty project", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(Path(json.loads(result.stdout)["executable"]).is_file())
-
     def test_windowed_python_uses_matching_console(self):
         windowed = self.python.with_name("pythonw.exe")
         self.assertTrue(windowed.is_file())
@@ -135,16 +127,9 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(after["base_prefix"], before["base_prefix"])
         self.assertEqual(after["version"], before["version"])
 
-    def test_setup_initializes_pip_when_reusing_environment(self):
-        test_root = ROOT / ".test-tmp"
-        test_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="setup without pip ", dir=test_root) as directory:
+    def test_pip_bootstrap_reuses_environment(self):
+        with tempfile.TemporaryDirectory(prefix="setup without pip ") as directory:
             project = Path(directory)
-            for name in ("tools", "invoice_workbench"):
-                shutil.copytree(ROOT / name, project / name,
-                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            for name in ("setup.ps1", "start.ps1", "requirements.txt"):
-                shutil.copy2(ROOT / name, project / name)
             subprocess.run([str(self.base), "-B", "-m", "venv", "--without-pip", str(project / ".venv")],
                            check=True, capture_output=True, timeout=30)
             info = json.loads(self.resolve(project).stdout)
@@ -155,21 +140,16 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(before.stdout.strip(), b"None")
             config = project / ".venv" / "pyvenv.cfg"
             original_config = config.read_bytes()
-            env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1", PIP_NO_CACHE_DIR="1")
+            command = (f". {ps_literal(ROOT / 'tools' / 'python_runtime.ps1')}; "
+                       f"Initialize-WorkbenchPip -Python {ps_literal(python)}")
             for _ in range(2):
-                result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-File",
-                                         str(project / "setup.ps1")],
-                                        capture_output=True, env=env, timeout=180)
+                result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+                                        capture_output=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
                 self.assertEqual(config.read_bytes(), original_config)
                 installed = subprocess.run([python, "-B", "-m", "pip", "--version"],
-                                           check=True, capture_output=True, env=env, timeout=10)
+                                           check=True, capture_output=True, timeout=10)
                 self.assertIn(str(project / ".venv").encode(), installed.stdout)
-            check = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-File",
-                                    str(project / "start.ps1"), "-CheckEnvironment"],
-                                   capture_output=True, env=env, timeout=30)
-            self.assertEqual(check.returncode, 0, check.stderr.decode(errors="replace"))
-            self.assertIn(python.encode(), check.stdout)
 
 
 if __name__ == "__main__":

@@ -15,9 +15,10 @@ if ([System.IO.Path]::GetFullPath($runtime.prefix) -ne [System.IO.Path]::GetFull
     if ($LASTEXITCODE -ne 0) { throw 'Failed to create Python virtual environment. Please check the log errors.' }
 }
 $environmentRuntime = Get-WorkbenchPython -Python $runtime.environment_python -ProjectRoot $PSScriptRoot -Setup
-& $environmentRuntime.executable -B -m ensurepip --upgrade
-if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize pip in the Python virtual environment. Please check the log errors.' }
+Initialize-WorkbenchPip -Python $environmentRuntime.executable
 & $environmentRuntime.executable -B -m pip install -r (Join-Path $PSScriptRoot 'requirements.txt')
 if ($LASTEXITCODE -ne 0) { throw "Failed to install dependencies ($($environmentRuntime.platform)). Please check the log errors." }
+& $environmentRuntime.executable -B (Join-Path $PSScriptRoot 'tools\build_ofd.py')
+if ($LASTEXITCODE -ne 0) { throw 'Failed to build the local OFD renderer. Please check the log errors.' }
 $null = Get-WorkbenchPython -Python $environmentRuntime.executable -ProjectRoot $PSScriptRoot
 Write-Host 'Environment installation completed. Run .\start.ps1 to start the program.'

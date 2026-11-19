@@ -333,21 +333,19 @@ class InteractionTests(unittest.TestCase):
         self.app.details.control.buttons[1].invoke()
         self.app.update()
         self.assertIsNotNone(self.app.preview_after)
-        generation = self.app.preview_generation
         self.app.hide_detail()
         self.assertIsNone(self.app.preview_after)
         self.app.preview_canvas.master.event_generate("<Configure>")
         self.app.update()
         self.assertIsNone(self.app.preview_after)
         self.app.render_preview()
-        self.assertEqual(self.app.preview_generation, generation)
         self.assertEqual(self.app.preview_canvas.find_all(), ())
         self.app.show_detail()
         deadline = time.monotonic() + 5
         while self.app.preview_after is not None and time.monotonic() < deadline:
             self.app.update()
             time.sleep(0.01)
-        self.assertGreater(self.app.preview_generation, generation)
+        self.assertIsNone(self.app.preview_after)
         self.assertTrue(self.app.preview_canvas.find_all())
 
     def test_preview_zoom_and_resize_keep_the_scroll_position_until_file_changes(self):
@@ -362,12 +360,11 @@ class InteractionTests(unittest.TestCase):
         self.app.file_choice.current(next(n for n, file in enumerate(item["files"]) if file["name"].endswith(".pdf")))
         self.app.preview_file_changed()
         self.assertIsNotNone(self.app.image_reference)
-        key, generation = self.app.preview_key, self.app.preview_generation
+        key = self.app.preview_key
         width = self.app.image_reference.width()
         self.app.zoom_preview(1.25)
         self.assertGreater(self.app.image_reference.width(), width)
         self.assertEqual(self.app.preview_key, key)
-        self.assertGreater(self.app.preview_generation, generation)
         canvas = self.app.preview_canvas
         self.app.zoom_preview(1.25)
         canvas.xview_moveto(0.2)
@@ -383,19 +380,19 @@ class InteractionTests(unittest.TestCase):
         x, y = canvas.xview()[0], canvas.yview()[0]
         self.assertGreater(x, 0)
         old_scroll_width = int(canvas.cget("scrollregion").split()[2])
-        resize_generation = self.app.preview_generation
+        old_image_width = self.app.image_reference.width()
         resized_width = self.app.winfo_width() + self.app.theme.px(400)
         self.app.maxsize(resized_width, self.app.winfo_height())
         self.app.geometry(f"{resized_width}x{self.app.winfo_height()}")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             self.app.update()
-            if (canvas.winfo_width() > old_scroll_width and self.app.preview_generation > resize_generation
-                    and self.app.preview_after is None):
+            if (canvas.winfo_width() > old_scroll_width and self.app.preview_after is None
+                    and self.app.image_reference.width() > old_image_width):
                 break
             time.sleep(0.01)
         self.assertGreater(canvas.winfo_width(), old_scroll_width)
-        self.assertGreater(self.app.preview_generation, resize_generation)
+        self.assertGreater(self.app.image_reference.width(), old_image_width)
         self.assertIsNone(self.app.preview_after)
         self.assertEqual(self.app.preview_key, key)
         self.assertAlmostEqual(canvas.xview()[0], x, delta=0.01)
@@ -411,7 +408,7 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual(canvas.yview()[0], 0)
         self.app.details.control.buttons[2].invoke()
         self.app.update()
-        self.assertEqual(self.app.details.index("current"), 2)
+        self.assertEqual(self.app.details.current_index, 2)
 
 
 class DpiLayoutTests(unittest.TestCase):

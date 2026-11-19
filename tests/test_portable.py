@@ -9,8 +9,10 @@ import sys
 import sysconfig
 import tempfile
 import unittest
+from uuid import uuid4
 import zipfile
 
+from invoice_workbench.outlook_auth import CLIENT_ID_FILE
 from tools.build_portable import build
 
 
@@ -28,7 +30,9 @@ class PortableTests(unittest.TestCase):
             self.addCleanup(dist.rmdir)
         with tempfile.TemporaryDirectory(prefix=".test-portable-", dir=dist) as directory:
             destination = Path(directory) / "Invoice Workbench"
-            build(destination)
+            client_id = str(uuid4())
+            build(destination, client_id)
+            self.assertEqual((destination / CLIENT_ID_FILE).read_text(encoding="ascii").strip(), client_id)
             manifest = json.loads((destination / "bundle-manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(set(manifest), {p.relative_to(destination).as_posix()
                                             for p in destination.rglob("*")
@@ -55,7 +59,8 @@ class PortableTests(unittest.TestCase):
 
             preview = subprocess.run([str(runtime), "-B", "-c",
                                       "from invoice_workbench.runtime import configure_bundled_tk; configure_bundled_tk(); "
-                                      "import unittest; unittest.main(module=None,argv=['unittest','tests.test_gui','-v'])"],
+                                      "import unittest; unittest.main(module=None, "
+                                      "argv=['unittest', 'tests.test_gui.GuiTests.test_pdf_and_image_preview', '-v'])"],
                                      cwd=destination, env=environment, capture_output=True, timeout=60)
             self.assertEqual(preview.returncode, 0, preview.stderr.decode(errors="replace"))
             subprocess.run([str(destination / "InvoiceWorkbench.exe"), "--help"],

@@ -23,6 +23,12 @@
     }
 }
 
+function Initialize-WorkbenchPip {
+    param([Parameter(Mandatory = $true)][string]$Python)
+    & $Python -B -m ensurepip --upgrade
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize pip in the Python virtual environment. Please check the log errors.' }
+}
+
 function Get-WorkbenchPython {
     param(
         [string]$Python,
