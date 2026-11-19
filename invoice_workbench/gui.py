@@ -10,24 +10,36 @@ import shutil
 from tempfile import NamedTemporaryFile
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
 import pypdfium2 as pdfium
 
 from . import __version__
 from .domain import UserError, yuan
-from .import_dialogs import ImportHistory, MailScopeDialog, import_summary
-from .labels import INVOICE_STATUS, selectable, state_label
+from .filesystem import is_directory_link
+from .import_dialogs import ImportDialog, ImportHistory, LOCAL_MODE, MAIL_MODE, MailCredentialDialog, import_summary
+from .labels import INVOICE_IMPORT_GUIDE, INVOICE_STATUS, SETTINGS_HINT, selectable, state_label
 from .mail import IMAPMailbox, domain_list, mailbox_profile
 from .outlook_auth import OUTLOOK_IMAP_HOST, OutlookOAuth, configured_client_id, validate_client_id
 from .selection import SelectionDialog
-from .store import OCCUPIED_STATUSES, Store
+from .store import ARCHIVE_DIRECTORIES, INVOICE_INDEX, OCCUPIED_STATUSES, WORKSPACE_DATABASE, Store
 from .theme import COLORS, FONT, MONO, Theme, enable_dpi_awareness, fit_window, wrap_label
-from .widgets import SegmentedControl, SegmentedPages, ScrollableFrame, hover_rows, table_scrollers
+from .widgets import (CollapsibleSection, ScrollableFrame, SegmentedControl, SegmentedPages,
+                      StatusPill, hover_rows, table_scrollers)
 from .workflow import contains_invoices, import_directory, import_mailbox, remove_duplicate_files
 
 APP_ROOT = Path(__file__).resolve().parent.parent
+SETTINGS_WIDTH = 780
+GENERAL_SETTINGS, MAIL_SETTINGS, SYSTEM_SETTINGS = "常规与存储", "邮箱收票", "系统与重置"
+MAIL_SETTINGS_HINT = "保存后，在「导入发票」中连接邮箱。"
+MAIL_PROVIDER_NAMES = {
+    "imap.qq.com": "QQ 邮箱",
+    "imap.163.com": "网易 163 邮箱",
+    "imap.126.com": "网易 126 邮箱",
+    "imap.yeah.net": "网易 Yeah 邮箱",
+    OUTLOOK_IMAP_HOST: "Outlook",
+}
 
 
 def _read_settings(path):
@@ -47,7 +59,12 @@ def _startup_workspace(data_dir, settings_file):
         settings = _read_settings(APP_ROOT / "local-settings.json") | settings
     if data_dir is None and (saved := settings.get("data_directory")):
         directory = Path(saved).expanduser().resolve()
-    if not (directory / "invoices.json").exists() and contains_invoices(directory):
+    if directory.name.lower() == WORKSPACE_DATABASE:
+        return directory, config, settings, None
+    database = directory / WORKSPACE_DATABASE
+    if database.exists() or database.is_symlink():
+        return database, config, settings, None
+    if not (directory / INVOICE_INDEX).exists() and contains_invoices(directory):
         # 旧设置可能把发票原件目录当作工作区。该目录仅用于导入。
         return default, settings_file or default / "local-settings.json", settings, directory
     return directory, config, settings, None
@@ -85,15 +102,15 @@ class DuplicateFilesDialog(tk.Toplevel):
         self.accepted = False
         panel = ttk.Frame(self, padding=space.extra_large)
         panel.pack(fill="both", expand=True)
-        for text in (f"发现 {len(duplicates)} 个内容完全相同的发票副本。每组保留一份原件，工作区副本已校验。", f"源目录：{source}"):
+        for text in (f"发现 {len(duplicates)} 份内容相同的副本。删除所列副本后，每组保留一份。", f"源目录：{source}"):
             label = ttk.Label(panel, text=text, style="Muted.TLabel")
             label.pack(fill="x", pady=(0, space.small))
             wrap_label(label)
         actions = ttk.Frame(panel)
         actions.pack(side="top", fill="x", pady=(0, space.medium))
-        self.no_button = ttk.Button(actions, text="否，保留文件并继续", command=self.destroy)
+        self.no_button = ttk.Button(actions, text="保留全部", command=self.destroy)
         self.no_button.pack(side="right")
-        self.yes_button = ttk.Button(actions, text="是，删除重复文件", command=self.accept, style="Danger.TButton")
+        self.yes_button = ttk.Button(actions, text="删除所列副本", command=self.accept, style="Danger.TButton")
         self.yes_button.pack(side="right", padx=(0, space.small))
         listing = ttk.Frame(panel)
         listing.pack(fill="both", expand=True)
@@ -131,7 +148,7 @@ class Workbench(tk.Tk):
         directory, self.settings_file, self.settings, import_source = _startup_workspace(data_dir, settings_file)
         if recover_lock:
             self.withdraw()
-            accepted = messagebox.askyesno("恢复遗留会话", f"系统数据库：{directory}\n\n请确认所有电脑上的工具均已退出，网盘已同步完成。\n\n确认恢复？", parent=self)
+            accepted = messagebox.askyesno("恢复遗留会话", f"系统数据库：{directory}\n\n请确认其他设备已关闭此工作区、网盘已完成同步。\n\n确认恢复？", parent=self)
             if not accepted:
                 self.destroy()
                 return
@@ -140,6 +157,8 @@ class Workbench(tk.Tk):
         self.title("发票工作台 · Invoice Workbench")
         fit_window(self, self.theme, 1360, 820, 1080, 640)
         self.mailbox = None
+        self.mail_folders = ()
+        self.connecting_mail = False
         self.session_ok = False
         self.snapshot = {}
         self.invoices_by_id = {}
@@ -155,8 +174,12 @@ class Workbench(tk.Tk):
         self.preview_image = None
         self.preview_key = None
         self.preview_zoom = 1.0
+        self.preview_fit = True
         self.preview_after = None
+        self.preview_generation = 0
         self.preview_resize_position = None
+        self.import_dialog = None
+        self.last_import_report = None
         self.protocol("WM_DELETE_WINDOW", self.close_app)
         self._build()
         self.poll_id = self.after(80, self._poll)
@@ -186,9 +209,9 @@ class Workbench(tk.Tk):
         brand_subtitle = ttk.Label(sidebar, text="INVOICE WORKBENCH", style="Sidebar.TLabel", font=(FONT, 7))
         brand_subtitle.pack(anchor="w", padx=large, pady=(0, extra_large))
         self.page_specs = [
-            ("发票资料", "导入、核对与选票，集中处理每一张发票。", self._library_page),
-            ("报销批次", "查看选票记录，导出发票文件与 CSV 明细。", self._batch_page),
-            ("设置", "管理发票资料库与报销公司。", self._settings_page),
+            ("发票资料", "导入、核对和选用发票。", self._library_page),
+            ("报销批次", "查看批次，导出发票原件和明细。", self._batch_page),
+            ("设置", SETTINGS_HINT, self._settings_page),
         ]
         self.nav_buttons = []
         for index, (title, _, _) in enumerate(self.page_specs):
@@ -213,13 +236,16 @@ class Workbench(tk.Tk):
         main.rowconfigure(2, weight=1)
         self.page_title = tk.StringVar(self)
         self.page_hint = tk.StringVar(self)
-        title = ttk.Label(main, textvariable=self.page_title, style="Title.TLabel")
-        title.grid(row=0, column=0, sticky="w")
-        hint = ttk.Label(main, textvariable=self.page_hint, style="Muted.TLabel")
-        hint.grid(row=1, column=0, sticky="ew", pady=(tiny, large))
-        wrap_label(hint)
+        heading = ttk.Frame(main)
+        heading.grid(row=0, column=0, sticky="ew")
+        self.page_title_label = ttk.Label(heading, textvariable=self.page_title, style="Title.TLabel")
+        self.page_title_label.pack(fill="x")
+        self.page_hint_label = ttk.Label(heading, textvariable=self.page_hint, style="Muted.TLabel", width=1)
+        self.page_hint_label.pack(fill="x", pady=(tiny, large))
+        wrap_label(self.page_hint_label)
         self.pages = PageStack(main, self.page_changed)
         self.pages.grid(row=2, column=0, sticky="nsew")
+        self.pages.bind("<Configure>", self._align_page_heading)
         for _, _, build in self.page_specs:
             frame = ttk.Frame(self.pages)
             self.pages.add(frame)
@@ -229,13 +255,23 @@ class Workbench(tk.Tk):
         footer = ttk.Frame(main)
         footer.grid(row=4, column=0, sticky="ew", pady=(small, 0))
         footer.columnconfigure(0, weight=1)
+        footer.rowconfigure(0, minsize=p(28))
         self.status_text = tk.StringVar(self, value="打开资料库…")
         self.status_label = ttk.Label(footer, textvariable=self.status_text, style="Hint.TLabel", width=1)
         self.status_label.grid(row=0, column=0, sticky="ew")
         wrap_label(self.status_label)
-        self.progress = ttk.Progressbar(footer, mode="indeterminate", length=p(80))
-        self.reconnect_button = ttk.Button(footer, text="重新连接", command=self.reconnect_library)
-        self.cancel_task_button = ttk.Button(footer, text="取消邮箱连接", command=self.cancel_mail_connection)
+        self.progress = ttk.Progressbar(footer, mode="indeterminate", length=p(56))
+        self.progress.grid(row=0, column=1, padx=(small, 0))
+        self.task_pill = StatusPill(footer)
+        self.task_pill.grid(row=0, column=2, padx=(small, 0))
+        self.reconnect_button = ttk.Button(footer, text="重新连接", command=self.reconnect_library,
+                                           style="warning.ActionPill.TButton")
+        self.reconnect_button.grid(row=0, column=3, padx=(small, 0))
+        self.cancel_task_button = ttk.Button(footer, text="取消邮箱连接", command=self.cancel_mail_connection,
+                                             style="occupied.ActionPill.TButton")
+        self.cancel_task_button.grid(row=0, column=4, padx=(small, 0))
+        for control in (self.progress, self.task_pill, self.reconnect_button, self.cancel_task_button):
+            control.grid_remove()
         self.pages.select(0)
         self.compact_layout = None
 
@@ -252,14 +288,13 @@ class Workbench(tk.Tk):
             path.pack_configure(pady=tiny if compact else small)
             separator.grid_configure(pady=(tiny if compact else medium, 0))
             footer.grid_configure(pady=(tiny if compact else small, 0))
+            footer.rowconfigure(0, minsize=p(24) if compact else p(28))
             if compact:
                 brand_subtitle.pack_forget()
-                title.grid_remove()
-                hint.grid_remove()
+                heading.grid_remove()
             else:
                 brand_subtitle.pack(before=self.nav_buttons[0], anchor="w", padx=large, pady=(0, extra_large))
-                title.grid()
-                hint.grid()
+                heading.grid()
             self.update_workspace_path()
 
         self.bind("<Configure>", arrange_window, add="+")
@@ -268,108 +303,129 @@ class Workbench(tk.Tk):
         title, hint, _ = self.page_specs[index]
         self.page_title.set(title)
         self.page_hint.set(hint)
+        self._align_page_heading()
         for n, button in enumerate(self.nav_buttons):
             button.configure(style="Selected.Nav.TButton" if n == index else "Nav.TButton")
         self.schedule_preview()
+
+    def _align_page_heading(self, event=None):
+        margin = 0
+        if self.pages.current_index == 2:
+            margin = max(0, (self.pages.winfo_width() - self.theme.px(SETTINGS_WIDTH)) // 2)
+        self.page_title_label.pack_configure(padx=margin)
+        self.page_hint_label.pack_configure(padx=margin)
 
     def _library_page(self, page):
         p = self.theme.px
         tiny, small, medium, large, _ = self.theme.space
         page.columnconfigure(0, weight=1)
-        page.rowconfigure(4, weight=1)
+        page.rowconfigure(5, weight=1)
         self.stats_frame = ttk.Frame(page)
         self.stats_frame.grid(row=0, column=0, sticky="ew", pady=(0, large))
         self.stats = []
         stat_titles = ("发票记录", "待核对 / 冲突", "可用票面合计", "已占用")
-        for index, title in enumerate(stat_titles):
+        self.metric_buttons = {}
+        for index, (title, target) in enumerate(zip(stat_titles, (None, "待核对", "可用", "已占用"))):
             if index:
-                ttk.Separator(self.stats_frame, orient="vertical").grid(row=0, column=index * 2 - 1, sticky="ns", padx=large, pady=tiny)
-            metric = ttk.Frame(self.stats_frame)
-            metric.grid(row=0, column=index * 2, sticky="ew")
+                tk.Frame(self.stats_frame, width=1, background=COLORS.line).grid(
+                    row=0, column=index * 2 - 1, sticky="ns", padx=small, pady=tiny)
             self.stats_frame.columnconfigure(index * 2, weight=2 if index == 2 else 1)
-            label = ttk.Label(metric, text=title, style="Hint.TLabel")
-            label.pack(fill="x")
-            wrap_label(label)
             var = tk.StringVar(self, value="—")
-            ttk.Label(metric, textvariable=var, style="Stat.TLabel", width=1).pack(fill="x", pady=(tiny, 0))
+            caption = tk.StringVar(self, value=f"{title}\n—")
+            var.trace_add("write", lambda *_, name=title, value=var, text=caption: text.set(f"{name}\n{value.get()}"))
+            if target:
+                metric = ttk.Button(self.stats_frame, textvariable=caption, style="Metric.TButton",
+                                    command=lambda value=target: self.toggle_invoice_filter(value))
+                self.metric_buttons[target] = metric
+            else:
+                metric = ttk.Label(self.stats_frame, textvariable=caption, style="Metric.TLabel")
+            metric.grid(row=0, column=index * 2, sticky="nsew")
             self.stats.append(var)
         toolbar = ttk.Frame(page)
         toolbar.grid(row=1, column=0, sticky="ew", pady=(0, medium))
-        actions = ttk.Frame(toolbar)
-        actions.grid(row=0, column=0, sticky="w", padx=(0, small))
-        intake = ttk.Menubutton(actions, text="导入发票")
-        menu = tk.Menu(intake, tearoff=False)
-        menu.add_command(label="导入发票文件夹…", command=self.import_directory)
-        menu.add_command(label="从邮箱收票…", command=self.open_mail)
-        menu.add_separator()
-        menu.add_command(label="导入记录…", command=self.open_import_history)
-        intake.configure(menu=menu)
-        intake.pack(side="left")
-        self.actions.append(intake)
-        self.button(actions, "按额度选票", self.open_selection, side="left", padx=(small, 0))
-        searchbar = ttk.Frame(toolbar)
-        searchbar.grid(row=0, column=1, sticky="ew")
-        toolbar.columnconfigure(1, weight=1)
-        ttk.Label(searchbar, text="搜索", style="Muted.TLabel").pack(side="left", padx=(0, small))
-        self.search = tk.StringVar(self)
-        self.search_entry = ttk.Entry(searchbar, textvariable=self.search, width=1)
-        self.search_entry.pack(side="left", fill="x", expand=True)
-        self.search_entry.bind("<KeyRelease>", lambda event: self.fill_invoices())
-        self.search_entry.bind("<Escape>", lambda event: self.clear_search())
-        ttk.Button(searchbar, text="清空", style="Quiet.TButton", command=self.clear_search).pack(side="right", padx=(small, 0))
-        def arrange_toolbar(event):
-            wrap = event.width < actions.winfo_reqwidth() + p(150)
-            searchbar.grid(row=int(wrap), column=0 if wrap else 1,
-                           columnspan=2 if wrap else 1, sticky="ew", pady=(tiny if wrap else 0, 0))
-        toolbar.bind("<Configure>", arrange_toolbar)
+        self.selection_button = self.button(toolbar, "按额度选票", self.open_selection, True, side="left")
+        self.intake_button = self.button(toolbar, "导入发票", self.open_import, side="left", padx=(small, 0))
+        self.history_button = self.button(toolbar, "导入记录", self.open_import_history, side="right")
+        self.history_button.configure(style="Quiet.TButton")
+
         filters = ttk.Frame(page)
         filters.grid(row=2, column=0, sticky="ew", pady=(0, small))
+        filters.columnconfigure(1, weight=1)
         self.filter = tk.StringVar(self, value="全部")
         self.filter_control = SegmentedControl(filters, ("全部", "待核对", "可用", "已占用", "同票冲突"),
                                                variable=self.filter, command=self.fill_invoices, theme=self.theme)
-        self.filter_control.pack(side="left")
-
-        def show_stats():
-            text = "\n".join(f"{title}  {value.get()}" for title, value in zip(stat_titles, self.stats))
-            messagebox.showinfo("发票统计", text, parent=self)
-
-        stats_button = ttk.Button(filters, text="统计", style="Quiet.TButton", command=show_stats)
-        self.list_summary = tk.StringVar(self, value="还没有发票，点击上方“导入发票文件夹”开始。")
-        summary = ttk.Label(page, textvariable=self.list_summary, style="Hint.TLabel")
+        self.filter_control.grid(row=0, column=0, sticky="w")
+        searchbar = ttk.Frame(filters)
+        searchbar.grid(row=0, column=1, sticky="e", padx=(small, 0))
+        ttk.Label(searchbar, text="搜索", style="Muted.TLabel").pack(side="left", padx=(0, small))
+        search_field = tk.Frame(searchbar, background=COLORS.line, borderwidth=0, padx=1, pady=1)
+        search_field.pack(side="left", fill="x", expand=True)
+        self.search = tk.StringVar(self)
+        self.search_entry = ttk.Entry(search_field, textvariable=self.search, width=22, style="Search.TEntry")
+        self.clear_search_button = ttk.Button(search_field, text="×", style="SearchClear.TButton",
+                                             command=self.clear_search)
+        self.clear_search_button.pack(side="right", fill="y")
+        self.search_entry.pack(side="left", fill="both", expand=True)
+        for widget in (self.search_entry, self.clear_search_button):
+            widget.bind("<FocusIn>", lambda event: search_field.configure(background=COLORS.secondary))
+            widget.bind("<FocusOut>", lambda event: search_field.configure(background=COLORS.line))
+        self.search.trace_add("write", lambda *_: self.fill_invoices())
+        self.search_entry.bind("<Escape>", lambda event: self.clear_search())
+        self.list_summary = tk.StringVar(self, value=INVOICE_IMPORT_GUIDE)
+        summary = ttk.Label(page, textvariable=self.list_summary, style="Muted.TLabel", width=1)
         summary.grid(row=3, column=0, sticky="ew", pady=(0, small))
         wrap_label(summary)
+        self.import_banner = ttk.Frame(page, style="Surface.TFrame", padding=(small, tiny))
+        self.import_banner.grid(row=4, column=0, sticky="ew", pady=(0, small))
+        self.import_banner.grid_remove()
+        ttk.Button(self.import_banner, text="×", style="Quiet.TButton", command=self.dismiss_import_result).pack(side="right")
+        self.import_result_link = ttk.Button(self.import_banner, text="查看导入记录", style="Quiet.TButton",
+                                             command=lambda: self.open_import_history(self.last_import_report))
+        self.import_result_link.pack(side="right", padx=(small, 0))
+        self.import_result = ttk.Label(self.import_banner, width=1, justify="left")
+        self.import_result.pack(side="left", fill="x", expand=True)
+        wrap_label(self.import_result, inset=2 * small)
         splitter = self.splitter = ttk.Panedwindow(page, orient="horizontal")
-        splitter.grid(row=4, column=0, sticky="nsew")
+        splitter.grid(row=5, column=0, sticky="nsew")
         left, right = ttk.Frame(splitter), ttk.Frame(splitter, padding=(large, 0, 0, 0))
         self.detail_pane = right
         self.detail_visible = False
         splitter.add(left, weight=6)
         columns = ("file", "number", "date", "amount", "state")
         self.tree = ttk.Treeview(left, columns=columns, displaycolumns=("amount", "number", "date", "file"),
-                                 show=("tree", "headings"), selectmode="browse")
-        self.tree.heading("#0", text="状态")
-        self.tree.column("#0", width=p(92), minwidth=p(92), stretch=False)
+                                 show=("tree", "headings"), selectmode="browse", style="Invoice.Treeview")
+        self.tree.heading("#0", text="状态 / 来源")
+        self.tree.column("#0", width=p(142), minwidth=p(142), stretch=False)
         for name, title, width in zip(columns[:-1], ("文件名", "发票号码", "开票日期", "金额 / 元"), (190, 190, 110, 100)):
             self.tree.heading(name, text=title)
-            self.tree.column(name, width=p(width), minwidth=p(80), stretch=name == "file", anchor="e" if name == "amount" else "w")
+            self.tree.column(name, width=p(82 if name == "amount" else width), minwidth=p(76),
+                             stretch=name == "file", anchor="e" if name == "amount" else "w")
         table_scrollers(left, self.tree)
         hover_rows(self.tree)
-        self.empty_hint = tk.Label(left, text="还没有发票\n\n点击上方“导入发票文件夹”即可添加。", bg=COLORS.canvas, fg=COLORS.secondary,
-                                   font=(FONT, 11), justify="center")
+        self.empty_card = ttk.Frame(self.tree, style="SettingsCard.TFrame", padding=(medium, small))
+        self.empty_hint = ttk.Label(self.empty_card, style="Section.TLabel", anchor="center")
+        self.empty_hint.pack(fill="x")
+        self.empty_actions = ttk.Frame(self.empty_card)
+        self.empty_actions.pack(pady=(small, 0))
+        self.empty_import = self.button(self.empty_actions, "导入发票", self.open_import, side="left")
+        self.empty_clear = ttk.Button(self.empty_actions, text="清除筛选", command=self.reset_invoice_filters)
         self.tree.bind("<<TreeviewSelect>>", self.select_invoice)
-        self.tree.bind("<Double-1>", lambda e: self.show_detail() if self.current_id else None)
+        self.tree.bind("<ButtonRelease-1>", lambda event: self.show_detail()
+                       if self.current_id and self.tree.identify_row(event.y) == self.current_id else None)
         self.tree.bind("<Up>", lambda event: self.move_invoice(-1))
         self.tree.bind("<Down>", lambda event: self.move_invoice(1))
         self.details_title = tk.StringVar(self, value="选择一张发票查看详情")
         detail_header = ttk.Frame(right)
         detail_header.pack(fill="x", pady=(0, medium))
-        title = ttk.Label(detail_header, textvariable=self.details_title, font=(FONT, 11, "bold"), width=1)
+        self.detail_close = ttk.Button(detail_header, text="×", style="Quiet.TButton", command=self.hide_detail)
+        self.detail_close.pack(side="right")
+        self.detail_status = StatusPill(detail_header)
+        self.detail_status.pack(side="right", padx=(tiny, 0))
+        title = ttk.Label(detail_header, textvariable=self.details_title, font=(FONT, 10, "bold"), width=1)
         title.pack(side="left", fill="x", expand=True)
         wrap_label(title)
         self.details = SegmentedPages(right, ("字段核对", "原票预览", "提取文本"), theme=self.theme)
         self.details.pack(fill="both", expand=True)
-        ttk.Button(self.details.bar, text="收起", style="Quiet.TButton", command=self.hide_detail).pack(
-            side="right", before=self.details.control, padx=(tiny, 0))
         form_page, preview, text_page = self.details.frames
         self.warning_text = tk.StringVar(self)
         self.review_actions = ttk.Frame(form_page, padding=(0, tiny, 0, 0))
@@ -402,7 +458,8 @@ class Workbench(tk.Tk):
         self.status_choice = ttk.Combobox(form, textvariable=self.invoice_status, values=list(INVOICE_STATUS.values()), state="disabled", width=1)
         self.status_choice.grid(row=18, column=0, sticky="ew", padx=(0, small), pady=(0, small))
         self.status_choice.bind("<<ComboboxSelected>>", self.change_invoice_status)
-        help_text = ttk.Label(form, text="已退回或可用会释放当前批次占用。核验通过且公司匹配后可再次选用。\n同票文件在导入时自动归并。", style="Hint.TLabel", width=1)
+        help_text = ttk.Label(form, text="改为「已退回」或「可用」可释放批次占用。核验通过且公司匹配后可再次选用。",
+                              style="Hint.TLabel", width=1)
         help_text.grid(row=19, column=0, sticky="ew", padx=(0, small), pady=tiny)
         wrap_label(help_text)
         self.recognize_button = ttk.Button(form, text="重新识别原件", command=self.recognize_again, state="disabled")
@@ -411,17 +468,23 @@ class Workbench(tk.Tk):
         filebar = ttk.Frame(preview)
         filebar.pack(fill="x", pady=(0, small))
         self.file_choice = ttk.Combobox(filebar, state="readonly", width=1)
-        self.button(filebar, "打开原件", self.open_original, side="right", padx=(small, 0))
+        self.original_button = self.button(filebar, "打开原件", self.open_original, side="right", padx=(small, 0))
         self.file_choice.pack(side="left", fill="x", expand=True)
         self.file_choice.bind("<<ComboboxSelected>>", self.preview_file_changed)
         zoom = ttk.Frame(preview)
         zoom.pack(fill="x", pady=(0, small))
-        ttk.Button(zoom, text="适应宽度", style="Quiet.TButton", command=lambda: self.zoom_preview(None)).pack(side="left")
-        ttk.Button(zoom, text="−", width=3, command=lambda: self.zoom_preview(1 / 1.25)).pack(side="left", padx=tiny)
-        ttk.Button(zoom, text="+", width=3, command=lambda: self.zoom_preview(1.25)).pack(side="left")
+        self.zoom_out_button = ttk.Button(zoom, text="−", width=3, command=lambda: self.zoom_preview(1 / 1.25))
+        self.zoom_out_button.pack(side="left")
+        self.zoom_reset_button = ttk.Button(zoom, text="100%", command=self.reset_preview_zoom)
+        self.zoom_reset_button.pack(side="left", padx=tiny)
+        self.zoom_in_button = ttk.Button(zoom, text="+", width=3, command=lambda: self.zoom_preview(1.25))
+        self.zoom_in_button.pack(side="left")
+        self.zoom_fit_button = ttk.Button(zoom, text="适应宽度", style="Quiet.TButton", command=lambda: self.zoom_preview(None))
+        self.zoom_fit_button.pack(side="left", padx=(tiny, 0))
         self.zoom_text = tk.StringVar(self, value="100%")
-        ttk.Label(zoom, textvariable=self.zoom_text, style="Hint.TLabel").pack(side="right")
-        preview_hint = ttk.Label(preview, text="PDF 显示首页 · 多页票据可打开原件", style="Hint.TLabel")
+        zoom_level = ttk.Label(zoom, textvariable=self.zoom_text, style="Hint.TLabel")
+        zoom_level.pack(side="right")
+        preview_hint = ttk.Label(preview, text="预览 PDF 首页。查看其余页面请打开原件。", style="Hint.TLabel")
         preview_hint.pack(anchor="w", pady=(0, small))
         preview_area = ttk.Frame(preview)
         preview_area.pack(fill="both", expand=True)
@@ -438,142 +501,285 @@ class Workbench(tk.Tk):
         self.splitter.bind("<ButtonRelease-1>", self.constrain_detail)
 
         compact = False
-        narrow = None
-
-        def arrange_details():
-            if compact and self.details.current_index == 1 and not self.draft_is_filtered():
-                detail_header.pack_forget()
-            else:
-                detail_header.pack(before=self.details, fill="x", pady=(0, tiny if compact else medium))
-
-        def change_detail_page(event):
-            arrange_details()
-            self.schedule_preview()
+        layout = None
 
         def arrange_library(event):
-            nonlocal compact, narrow
+            nonlocal compact, layout
             short = event.height < p(515)
             use_short_labels = short or event.width < p(650)
-            if (short, use_short_labels) == (compact, narrow):
+            compact_filters = event.width < p(650)
+            small_metrics = event.height < p(400)
+            if (short, use_short_labels, compact_filters, small_metrics) == layout:
                 return
             compact, narrow = short, use_short_labels
+            layout = (short, narrow, compact_filters, small_metrics)
             gap = tiny if compact else small
-            toolbar.grid_configure(pady=(0, tiny if compact else medium))
+            toolbar.grid_configure(pady=(0, p(2) if compact else medium))
             filters.grid_configure(pady=(0, gap))
-            arrange_details()
-            self.details.bar.pack_configure(pady=(0, tiny if compact else medium))
+            detail_header.pack_configure(pady=(0, 0 if compact else medium))
+            self.details.bar.pack_configure(pady=(0, p(2) if compact else medium))
             right.configure(padding=(small if narrow else large, 0, 0, 0))
             self.review_banner.configure(pady=p(2) if compact else tiny)
             self.review_banner.pack_configure(pady=0 if compact else (0, tiny))
-            labels = ("核对", "预览", "文本") if narrow else self.details.labels
-            for button, label in zip(self.details.control.buttons, labels):
-                button.configure(text=label, style="Compact.Pill.TRadiobutton" if narrow else "Pill.TRadiobutton")
+            labels = ("核对", "预览", "文本") if compact_filters else self.details.labels
+            self.details.control.set_compact(narrow, labels=labels)
+            self.filter_control.set_compact(compact_filters)
+            self.search_entry.configure(width=9 if compact_filters else 22,
+                                        style="Compact.Search.TEntry" if small_metrics else "Search.TEntry")
+            self.selection_button.configure(style="Compact.Primary.TButton" if small_metrics else "Primary.TButton")
+            self.intake_button.configure(style="Compact.TButton" if small_metrics else "TButton")
+            self.history_button.configure(style="Compact.Quiet.TButton" if small_metrics else "Quiet.TButton")
             self.review_button.configure(style="Compact.Primary.TButton" if narrow else "Primary.TButton")
+            self.review_button.configure(text="保存并核验" if compact_filters else "保存字段并核验")
             self.archive_button.configure(style="Compact.Danger.TButton" if narrow else "Danger.TButton")
-            filebar.pack_configure(pady=(0, gap))
-            zoom.pack_configure(pady=(0, gap))
-            if compact:
+            self.review_actions.configure(padding=0 if compact else (0, tiny, 0, 0))
+            self.detail_close.configure(style="Compact.Quiet.TButton" if compact else "Quiet.TButton")
+            self.file_choice.configure(style="Compact.TCombobox" if compact else "TCombobox")
+            for button in (self.original_button, self.zoom_in_button, self.zoom_out_button, self.zoom_reset_button):
+                button.configure(style="Compact.TButton" if compact else "TButton")
+            self.zoom_fit_button.configure(style="Compact.Quiet.TButton" if compact else "Quiet.TButton")
+            filebar.pack_configure(pady=(0, p(2) if small_metrics else gap))
+            zoom.pack_configure(pady=(0, p(2) if small_metrics else gap))
+            if small_metrics:
                 self.stats_frame.grid_remove()
                 summary.grid_remove()
-                stats_button.pack(side="right")
-                preview_hint.pack_forget()
             else:
                 self.stats_frame.grid()
                 summary.grid()
-                stats_button.pack_forget()
+            if compact:
+                preview_hint.pack_forget()
+                zoom_level.pack_forget()
+            else:
                 preview_hint.pack(before=preview_area, anchor="w", pady=(0, small))
+                zoom_level.pack(side="right")
 
         page.bind("<Configure>", arrange_library)
-        self.details.bind("<<SegmentedPageChanged>>", change_detail_page)
-        self.details_title.trace_add("write", lambda *_: arrange_details())
+        self.details.bind("<<SegmentedPageChanged>>", lambda event: self.schedule_preview())
 
     def _batch_page(self, page):
         p = self.theme.px
         space = self.theme.space
         page.columnconfigure(0, weight=1)
-        page.rowconfigure(2, weight=3, minsize=p(78))
-        page.rowconfigure(3, weight=2, minsize=p(40))
+        page.rowconfigure(1, weight=2, minsize=p(80))
         actions = ttk.Frame(page)
-        actions.grid(row=0, column=0, sticky="ew", pady=(0, space.tiny))
-        self.button(actions, "导出原票与明细", self.export_batch, True, side="left")
-        hint = ttk.Label(page, text="整票占用，超额不结转。发票报销状态在详情中管理，这里保留批次历史。", style="Muted.TLabel")
-        hint.grid(row=1, column=0, sticky="ew", pady=(0, space.small))
-        wrap_label(hint)
+        actions.grid(row=0, column=0, sticky="ew", pady=(0, space.small))
+        self.batch_export_button = ttk.Button(actions, text="导出原票与明细", style="Primary.TButton",
+                                              command=self.export_batch, state="disabled")
+        self.batch_export_button.pack(side="right", padx=(space.small, 0))
+        self.batch_summary = tk.StringVar(self)
+        summary = ttk.Label(actions, textvariable=self.batch_summary, style="Muted.TLabel", width=1)
+        summary.pack(side="left", fill="x", expand=True)
+        wrap_label(summary)
         listing = ttk.Frame(page)
-        listing.grid(row=2, column=0, sticky="nsew")
-        columns = ("time", "count", "target", "total", "declared")
-        self.batch_tree = ttk.Treeview(listing, columns=columns, show="headings", selectmode="browse", height=2)
-        for key, title, width in zip(columns, ("创建时间", "张数", "目标 / 元", "票面 / 元", "申报 / 元"), (200, 65, 130, 130, 130)):
-            self.batch_tree.heading(key, text=title)
-            self.batch_tree.column(key, width=p(width), minwidth=p(60), anchor="w" if key == "time" else "e")
-        table_scrollers(listing, self.batch_tree)
-        hover_rows(self.batch_tree)
+        listing.grid(row=1, column=0, sticky="nsew")
+        self.batch_tree = self._batch_table(listing, (
+            ("time", "创建时间", 150, 140, "w"),
+            ("count", "张数", 48, 42, "e"),
+            ("target", "目标 / 元", 80, 76, "e"),
+            ("total", "票面 / 元", 80, 76, "e"),
+            ("declared", "申报 / 元", 80, 76, "e"),
+        ))
         self.batch_tree.bind("<<TreeviewSelect>>", self.show_batch)
-        detail = ttk.Frame(page, style="Surface.TFrame")
-        detail.grid(row=3, column=0, sticky="nsew", pady=(space.tiny, 0))
-        self.batch_info = tk.Text(detail, height=2, width=1, wrap="word", state="disabled", relief="flat", borderwidth=0,
-                                  bg=COLORS.surface, fg=COLORS.secondary, font=(FONT, 10), padx=space.large, pady=space.small)
-        scroll = ttk.Scrollbar(detail, orient="vertical", command=self.batch_info.yview)
+        self.batch_details = ttk.Frame(page)
+        self.batch_details.grid(row=2, column=0, sticky="nsew", pady=(space.small, 0))
+        self.batch_details.grid_remove()
+        metadata = ttk.Frame(self.batch_details, style="Surface.TFrame")
+        metadata.pack(fill="x", pady=(0, space.tiny))
+        self.batch_info = tk.Text(metadata, height=2, width=1, wrap="word", state="disabled", relief="flat",
+                                  borderwidth=0, highlightthickness=0, bg=COLORS.surface, fg=COLORS.text,
+                                  font=(FONT, 10), padx=space.small, pady=space.tiny)
+        self.batch_info.tag_configure("caption", foreground=COLORS.secondary)
+        self.batch_info.tag_configure("identifier", font=(MONO, 10))
+        scroll = ttk.Scrollbar(metadata, orient="vertical", command=self.batch_info.yview)
         scroll.pack(side="right", fill="y")
         self.batch_info.configure(yscrollcommand=scroll.set)
-        self.batch_info.pack(fill="both", expand=True)
+        self.batch_info.pack(fill="x", expand=True)
+        items = ttk.Frame(self.batch_details)
+        items.pack(fill="both", expand=True)
+        self.batch_items = self._batch_table(items, (
+            ("number", "发票号码", 148, 140, "w"),
+            ("date", "开票日期", 88, 82, "w"),
+            ("amount", "金额 / 元", 68, 68, "e"),
+            ("status", "当前状态", 76, 76, "w"),
+            ("membership", "批次占用", 66, 64, "w"),
+        ))
+
+    def _batch_table(self, parent, columns):
+        p = self.theme.px
+        tree = ttk.Treeview(parent, columns=[column[0] for column in columns], show="headings",
+                            selectmode="browse", height=2)
+        for key, title, width, minimum, anchor in columns:
+            tree.heading(key, text=title, anchor=anchor)
+            tree.column(key, width=p(width), minwidth=p(minimum), anchor=anchor)
+        table_scrollers(parent, tree)
+        hover_rows(tree)
+        return tree
 
     def _settings_page(self, page):
-        tiny, small, medium, large, _ = self.theme.space
-        scroll = ScrollableFrame(page, theme=self.theme)
-        scroll.pack(fill="both", expand=True)
-        panel = scroll.content
-        library = ttk.Frame(panel, style="Surface.TFrame", padding=large)
-        library.pack(fill="x", pady=(0, large), padx=(0, medium))
-        ttk.Label(library, text="发票资料库", style="Surface.TLabel", font=(FONT, 12, "bold")).pack(anchor="w")
+        labels = (GENERAL_SETTINGS, MAIL_SETTINGS, SYSTEM_SETTINGS)
+        self.settings_pages = tabs = SegmentedPages(page, labels, theme=self.theme, capsule=True)
+        tabs.pack(fill="both", expand=True)
+
+        def center_settings(event):
+            margin = max(0, (event.width - self.theme.px(SETTINGS_WIDTH)) // 2)
+            tabs.pack_configure(padx=margin)
+
+        page.bind("<Configure>", center_settings)
+        space = self.theme.space
+        mail_footer = ttk.Frame(tabs.frames[1], style="SettingsCard.TFrame", padding=(space.large, space.small))
+        mail_footer.pack(side="bottom", fill="x", pady=(space.tiny, 0))
+        builders = (self._general_settings, lambda panel: self._mail_settings(panel, mail_footer), self._system_settings)
+        for frame, build in zip(tabs.frames, builders):
+            scroll = ScrollableFrame(frame, theme=self.theme)
+            scroll.pack(fill="both", expand=True)
+            build(scroll.content)
+            scroll.enable_scrolling()
+
+    def open_settings(self, section):
+        self.settings_pages.select(self.settings_pages.labels.index(section))
+        self.pages.select(2)
+
+    def _settings_card(self, panel, title):
+        space = self.theme.space
+        card = ttk.Frame(panel, style="SettingsCard.TFrame", padding=(space.large, self.theme.px(10)))
+        card.pack(fill="x", pady=(0, space.medium))
+        header = ttk.Frame(card)
+        header.pack(fill="x")
+        ttk.Label(header, text=title, style="Section.TLabel").pack(side="left")
+        return card, header
+
+    def _settings_field(self, parent, title, variable, *, surface=False, width=1):
+        style = "SurfaceMuted.TLabel" if surface else "Muted.TLabel"
+        ttk.Label(parent, text=title, style=style).pack(anchor="w", pady=(0, self.theme.space.tiny))
+        entry = ttk.Entry(parent, textvariable=variable, width=width)
+        entry.pack(fill="x")
+        return entry
+
+    def _general_settings(self, panel):
+        space = self.theme.space
+        library, header = self._settings_card(panel, "工作区存储位置")
+        self.library_button = self.button(header, "修改位置…", self.choose_workspace, side="right")
+        hint = ttk.Label(library, text="选择新目录会复制当前资料。选择已有工作区会打开其中的记录。",
+                         style="Muted.TLabel", width=1, justify="left")
+        hint.pack(fill="x", pady=(space.small, 0))
+        wrap_label(hint)
         self.directory_text = tk.StringVar(self)
-        directory = ttk.Label(library, textvariable=self.directory_text, style="SurfaceMuted.TLabel")
-        directory.pack(fill="x", pady=small)
+        directory = ttk.Label(library, textvariable=self.directory_text, style="Muted.TLabel", width=1)
+        directory.pack(fill="x", pady=(space.small, 0))
         wrap_label(directory)
-        library_actions = ttk.Frame(library, style="Surface.TFrame")
-        library_actions.pack(anchor="w")
-        self.library_button = self.button(library_actions, "选择资料库…", self.choose_library, side="left")
-        database = ttk.Frame(panel, style="Surface.TFrame", padding=large)
-        database.pack(fill="x", pady=(0, large), padx=(0, medium))
-        ttk.Label(database, text="系统数据库", style="Surface.TLabel", font=(FONT, 12, "bold")).pack(anchor="w")
-        self.database_text = tk.StringVar(self)
-        database_path = ttk.Label(database, textvariable=self.database_text, style="SurfaceMuted.TLabel")
-        database_path.pack(fill="x", pady=small)
-        wrap_label(database_path)
-        self.reset_button = self.button(database, "恢复初始化…", self.reset_workspace, anchor="w")
-        self.reset_button.configure(style="Danger.TButton")
-        help_text = ttk.Label(library, text="本地扫描和邮件收票使用此目录。", style="SurfaceMuted.TLabel")
-        help_text.pack(fill="x", pady=(medium, 0))
-        wrap_label(help_text)
-        company = ttk.Frame(panel, style="Surface.TFrame", padding=large)
-        company.pack(fill="x", pady=(0, large), padx=(0, medium))
-        ttk.Label(company, text="报销公司", style="Surface.TLabel", font=(FONT, 12, "bold")).pack(anchor="w")
+        self.legacy_storage_note = ttk.Label(library, style="Muted.TLabel", width=1, justify="left")
+        wrap_label(self.legacy_storage_note)
+        company, _ = self._settings_card(panel, "报销公司")
         self.company_name, self.company_tax = tk.StringVar(self), tk.StringVar(self)
-        for title, var in (("购买方抬头", self.company_name), ("购买方税号", self.company_tax)):
-            ttk.Label(company, text=title, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(medium, tiny))
-            ttk.Entry(company, textvariable=var, width=1).pack(fill="x")
-        self.button(company, "保存公司设置", self.save_company, True, anchor="w", pady=(medium, small))
-        help_text = ttk.Label(company, text="填写税号时精确匹配税号；同时填写抬头时两项都须匹配。", style="SurfaceMuted.TLabel")
-        help_text.pack(fill="x")
+        company_fields = ttk.Frame(company)
+        company_fields.pack(fill="x", pady=(space.small, 0))
+        fields = (("购买方抬头", self.company_name), ("购买方税号", self.company_tax))
+        for index, (title, variable) in enumerate(fields):
+            company_fields.columnconfigure(index, weight=1, uniform="company")
+            field = ttk.Frame(company_fields)
+            field.grid(row=0, column=index, sticky="ew", padx=(space.small if index else 0, 0))
+            self._settings_field(field, title, variable)
+        company_actions = ttk.Frame(company)
+        company_actions.pack(fill="x", pady=(space.medium, 0))
+        self.button(company_actions, "保存公司设置", self.save_company, True, side="right", padx=(space.small, 0))
+        help_text = ttk.Label(company_actions, text="同时填写抬头和税号时，两项都须匹配。", style="Muted.TLabel", width=1)
+        help_text.pack(side="left", fill="x", expand=True)
         wrap_label(help_text)
-        mail_settings = ttk.Frame(panel, style="Surface.TFrame", padding=large)
-        mail_settings.pack(fill="x", pady=(0, large), padx=(0, medium))
-        ttk.Label(mail_settings, text="IMAP 收票", style="Surface.TLabel", font=(FONT, 12, "bold")).pack(anchor="w")
-        self.mail_address = tk.StringVar(self, value=self.settings.get("mail_address", ""))
-        self.mail_host = tk.StringVar(self, value=self.settings.get("mail_host", ""))
-        self.mail_port = tk.StringVar(self, value=self.settings.get("mail_port", "993"))
-        self.mail_client_id = tk.StringVar(self, value=self.settings.get("mail_client_id", ""))
-        self.mail_blocked = tk.StringVar(self, value=", ".join(self.settings.get("mail_blocked_domains", [])))
-        for title, variable in (("邮箱地址", self.mail_address), ("IMAP 服务器（Outlook、QQ 和网易邮箱可留空）", self.mail_host),
-                                ("SSL/TLS 端口", self.mail_port), ("Outlook OAuth Client ID", self.mail_client_id),
-                                ("下载域名黑名单（逗号分隔）", self.mail_blocked)):
-            ttk.Label(mail_settings, text=title, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(medium, tiny))
-            ttk.Entry(mail_settings, textvariable=variable).pack(fill="x")
-        buttons = ttk.Frame(mail_settings, style="Surface.TFrame")
-        buttons.pack(anchor="w", pady=(medium, 0))
-        self.button(buttons, "保存收票设置", self.save_mail_settings, True, side="left")
-        self.button(buttons, "清除本次登录凭证", self.disconnect_mail, side="left", padx=(small, 0))
-        ttk.Label(panel, text=f"版本 {__version__}", style="Section.TLabel").pack(anchor="w")
+
+    def _system_settings(self, panel):
+        space = self.theme.space
+        database, _ = self._settings_card(panel, "系统数据库")
+        self.database_text = tk.StringVar(self)
+        path = ttk.Label(database, textvariable=self.database_text, style="Muted.TLabel", width=1)
+        path.pack(fill="x", pady=(space.small, 0))
+        wrap_label(path)
+        reset, _ = self._settings_card(panel, "恢复初始化")
+        notice = ttk.Label(reset, text="清空记录和设置。保留工作区位置、原件和导出文件。",
+                           style="Muted.TLabel", width=1)
+        notice.pack(fill="x", pady=(space.small, space.medium))
+        wrap_label(notice)
+        self.reset_button = self.button(reset, "恢复初始化…", self.reset_workspace, anchor="e")
+        self.reset_button.configure(style="Danger.TButton")
+
+    def _mail_settings(self, panel, footer):
+        p = self.theme.px
+        space = self.theme.space
+        card, header = self._settings_card(panel, "IMAP 收票配置")
+        self.mail_session_pill = StatusPill(header)
+        self.mail_session_pill.pack(side="right", padx=(space.small, 0))
+        ttk.Separator(card).pack(fill="x", pady=p(6))
+
+        self.mail_address, self.mail_host, self.mail_port, self.mail_client_id, self.mail_blocked = (
+            tk.StringVar(self) for _ in range(5))
+        self.mail_fields = (self.mail_address, self.mail_host, self.mail_port, self.mail_client_id, self.mail_blocked)
+        self._load_mail_fields()
+        ttk.Label(card, text="邮箱地址").pack(anchor="w", pady=(0, space.tiny))
+        address_line = ttk.Frame(card)
+        address_line.pack(fill="x")
+        address_line.columnconfigure(0, weight=1)
+        self.mail_address_entry = ttk.Entry(address_line, width=1, textvariable=self.mail_address)
+        self.mail_address_entry.grid(row=0, column=0, sticky="ew")
+        for event in ("<KeyRelease>", "<FocusOut>"):
+            self.mail_address_entry.bind(event, self._refresh_mail_provider)
+        self.mail_provider_pill = StatusPill(address_line, width=1, anchor="w", justify="left")
+        wrap_label(self.mail_provider_pill, inset=2 * space.small)
+        self.mail_provider_pill.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(space.tiny, 0))
+        inline = False
+
+        def arrange_address(event):
+            nonlocal inline
+            beside = event.width >= p(580)
+            if beside == inline:
+                return
+            inline = beside
+            address_line.columnconfigure(1, minsize=p(275) if inline else 0)
+            self.mail_provider_pill.grid_configure(row=0 if inline else 1, column=int(inline),
+                                                   columnspan=1 if inline else 2,
+                                                   padx=(space.small if inline else 0, 0),
+                                                   pady=(0 if inline else space.tiny, 0))
+
+        address_line.bind("<Configure>", arrange_address)
+        self._mail_provider_kind = None
+        self.mail_advanced = CollapsibleSection(card, "高级服务器设置", theme=self.theme)
+        self.mail_advanced.pack(fill="x", pady=(space.small, 0))
+        advanced = self.mail_advanced.content
+        connection = ttk.Frame(advanced, style="Surface.TFrame", padding=(space.tiny, 0))
+        connection.pack(fill="x")
+        connection.columnconfigure(0, weight=1)
+        host = ttk.Frame(connection, style="Surface.TFrame")
+        host.grid(row=0, column=0, sticky="ew", padx=(0, space.small))
+        self._settings_field(host, "IMAP 服务器（留空则自动识别）", self.mail_host, surface=True)
+        port = ttk.Frame(connection, style="Surface.TFrame")
+        port.grid(row=0, column=1, sticky="ew")
+        self._settings_field(port, "SSL/TLS 端口", self.mail_port, surface=True, width=8)
+        blocklist = ttk.Frame(advanced, style="Surface.TFrame", padding=(space.tiny, 0))
+        blocklist.pack(fill="x", pady=(space.small, 0))
+        self._settings_field(blocklist, "下载域名黑名单（逗号分隔）", self.mail_blocked, surface=True)
+        oauth = ttk.Frame(advanced, style="Surface.TFrame", padding=(space.tiny, 0))
+        oauth.pack(fill="x", pady=(space.small, space.tiny))
+        self.mail_client_entry = self._settings_field(oauth, "Outlook OAuth 客户端 ID", self.mail_client_id, surface=True)
+        oauth_hint = ttk.Label(oauth, style="SurfaceMuted.TLabel", width=1,
+                               text="已提供客户端 ID 时可留空。")
+        oauth_hint.pack(fill="x", pady=(space.tiny, 0))
+        wrap_label(oauth_hint)
+
+        self.mail_feedback = ttk.Label(footer, justify="left", width=1)
+        self.mail_feedback.pack(fill="x")
+        wrap_label(self.mail_feedback, inset=2 * space.small)
+        actions = ttk.Frame(footer)
+        actions.pack(fill="x", pady=(space.small, 0))
+        self.mail_clear_button = ttk.Button(actions, text="清除本次登录凭证", command=self.disconnect_mail,
+                                            state="disabled")
+        self.mail_clear_button.pack(side="right")
+        self.mail_save_button = self.button(actions, "保存收票设置", self.save_mail_settings, True,
+                                            side="right", padx=(0, space.small))
+        for variable in self.mail_fields:
+            variable.trace_add("write", self._mail_fields_changed)
+        for variable in (self.mail_address, self.mail_host, self.mail_port):
+            variable.trace_add("write", self._refresh_mail_provider)
+        self._refresh_mail_provider()
+        self._mail_fields_changed()
+        self._update_mail_session()
 
     def _save_settings(self, settings=None):
         path = self.settings_file
@@ -587,15 +793,13 @@ class Workbench(tk.Tk):
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    def open_library(self, directory, *, recover_lock=False):
+    def open_library(self, directory, *, recover_lock=False, require_existing=False):
         directory = Path(directory).expanduser()
-        if not self.store:
-            self.connection_directory = directory
         if self.store and self.store.root == directory.resolve():
             if not self.reload():
                 raise UserError(self.status_text.get())
             return
-        new = Store(directory, recover_lock=recover_lock)
+        new = Store(directory, recover_lock=recover_lock, require_existing=require_existing)
         settings = self.settings | {"data_directory": str(new.root)}
         try:
             snapshot = new.view(include_import_runs=False)
@@ -611,24 +815,63 @@ class Workbench(tk.Tk):
         self.settings = settings
         self.current_id = None
         self.clear_detail()
+        self.dismiss_import_result()
         self.search.set("")
         self.filter.set("全部")
         self._show_snapshot(snapshot)
 
-    def choose_library(self):
-        if not self.session_ok or self.busy or not self.allow_discard():
+    def choose_workspace(self):
+        if self.busy or not self.allow_discard():
             return
-        initial = self.store.library or self.settings.get("last_import_directory") or Path.home()
-        path = filedialog.askdirectory(title="选择存放发票原件的资料库", initialdir=str(initial), parent=self)
+        directory = self.store.workspace if self.store else self.connection_directory
+        if directory.name.lower() == WORKSPACE_DATABASE:
+            directory = directory.parent
+        path = filedialog.askdirectory(title="选择工作区存储位置", initialdir=str(directory) if directory.is_dir() else None,
+                                       parent=self, mustexist=True)
         if path:
-            store, revision = self.store, self.snapshot["revision"]
-            self.task("正在设置发票资料库…", lambda: store.set_library(revision, path),
-                      lambda _: self.status_text.set("已保存发票资料库路径。"))
+            self.change_workspace(path)
+
+    def change_workspace(self, path):
+        if self.busy:
+            return
+        store = self.store
+        current_database = store.root if store else self.connection_directory
+        path = Path(path).resolve()
+        if WORKSPACE_DATABASE in {part.lower() for part in path.parts} or any(
+                path.is_relative_to(current_database / directory) for directory in ARCHIVE_DIRECTORIES):
+            messagebox.showerror("无法选择工作区", "请选择独立的工作区根目录。", parent=self)
+            return
+        database = path / WORKSPACE_DATABASE
+        if database.is_symlink() or (database.exists() and is_directory_link(database)):
+            messagebox.showerror("无法选择工作区", "工作区的数据库目录不能使用目录链接。", parent=self)
+            return
+
+        def open_workspace(directory):
+            try:
+                self.open_library(directory, require_existing=True)
+            except (UserError, OSError, ValueError) as exc:
+                messagebox.showerror("无法打开工作区", str(exc), parent=self)
+                return
+            self.status_text.set("工作区已打开。")
+
+        if database.exists():
+            open_workspace(database)
+        elif (path / INVOICE_INDEX).is_file() and not (store and path == store.root and store.library):
+            open_workspace(path)
+        elif not self.session_ok:
+            messagebox.showerror("无法打开工作区", "当前数据库未连接。请选择已有工作区，或重新连接后再复制记录。",
+                                 parent=self)
+        else:
+            revision = self.snapshot["revision"]
+            self.task("正在复制工作区资料…", lambda: store.copy_workspace(revision, path),
+                      open_workspace, preserve_edits=False)
 
     def update_actions(self):
+        enabled = not self.busy and self.session_ok
         for button in self.actions:
-            enabled = not self.busy and self.session_ok
-            button.configure(state="normal" if enabled else "disabled")
+            available = not self.busy if button is self.library_button else enabled
+            button.configure(state="normal" if available else "disabled")
+        self.import_result_link.configure(state="normal" if enabled else "disabled")
         item = self.selected_item()
         editable = self.session_ok and not self.busy and bool(item)
         if editable:
@@ -642,26 +885,39 @@ class Workbench(tk.Tk):
         archivable = (self.session_ok and not self.busy and item
                       and (item.get("archived") or item.get("reimbursement_status") not in OCCUPIED_STATUSES))
         self.archive_button.configure(state="normal" if archivable else "disabled")
+        self.original_button.configure(state="normal" if self.session_ok and not self.busy and self.selected_file()
+                                       else "disabled")
+        self.update_batch_export()
 
     def connection_error(self, text):
         self.session_ok = False
         self.status_text.set(text)
-        self.reconnect_button.grid(row=0, column=2, sticky="e", padx=(self.theme.space.small, 0))
         self.update_connection_status()
         self.update_actions()
 
     def update_connection_status(self):
         self.workspace_status.set("◌ 正在处理" if self.busy else "● 数据库已连接" if self.session_ok else "○ 数据库未连接")
         self.workspace_label.configure(foreground=COLORS.secondary if self.session_ok else COLORS.warning)
-        self.status_label.configure(foreground=COLORS.text if self.busy else COLORS.muted if self.session_ok else COLORS.error)
+        self.status_label.configure(foreground=COLORS.text if self.busy else COLORS.secondary if self.session_ok else COLORS.error)
+        self._update_mail_session()
+        for control, visible in (
+            (self.progress, self.busy),
+            (self.task_pill, self.busy),
+            (self.reconnect_button, not self.session_ok and not self.busy),
+            (self.cancel_task_button, self.task_cancelled is not None),
+        ):
+            if visible:
+                control.grid()
+            else:
+                control.grid_remove()
 
     def update_workspace_path(self):
-        library = self.snapshot.get("library_directory")
-        if not library:
-            self.workspace_path.set("未配置发票资料库")
+        if not self.store:
+            self.workspace_path.set("工作区未连接")
             return
-        directory = Path(library)
-        self.workspace_path.set(directory.name if self.compact_layout else f"{directory.name}\n{directory.parent}")
+        directory = self.store.workspace
+        name = directory.name or str(directory)
+        self.workspace_path.set(name if self.compact_layout else f"{name}\n{directory.parent}")
 
     def reconnect_library(self):
         if self.busy or not self.allow_discard():
@@ -682,7 +938,7 @@ class Workbench(tk.Tk):
             self.connection_error(str(exc))
             # Local live writers remain protected by the OS guard even during recovery.
             if "未结束的会话" in str(exc) and messagebox.askyesno(
-                    "恢复资料连接", f"资料库：{directory}\n\n仅在其他电脑上的工具已关闭、网盘同步已完成时恢复。\n\n确认恢复此资料库的遗留会话？", parent=self):
+                    "恢复资料连接", f"系统数据库：{directory}\n\n请确认其他设备已关闭此工作区、网盘已完成同步。\n\n确认恢复？", parent=self):
                 try:
                     self.open_library(directory, recover_lock=True)
                 except (UserError, OSError, ValueError) as error:
@@ -705,7 +961,6 @@ class Workbench(tk.Tk):
         invoices = sorted(snapshot["invoices"], key=lambda item: (item.get("date", ""), item["created"]), reverse=True)
         self.invoices_by_id = {item["id"]: item for item in invoices}
         self.session_ok = True
-        self.reconnect_button.grid_remove()
         pending = occupied = available_total = 0
         for item in invoices:
             if item["reimbursement_status"] in OCCUPIED_STATUSES:
@@ -717,7 +972,12 @@ class Workbench(tk.Tk):
         values = (str(len(invoices)), str(pending), "¥ " + yuan(available_total), str(occupied))
         for var, value in zip(self.stats, values):
             var.set(value)
-        self.directory_text.set(self.snapshot.get("library_directory", "未配置发票资料库"))
+        self.directory_text.set(str(self.store.workspace))
+        if self.store.library and self.store.root.name != WORKSPACE_DATABASE:
+            self.legacy_storage_note.configure(text="此工作区使用旧版存储方式。可通过「修改位置」迁移资料。")
+            self.legacy_storage_note.pack(fill="x", pady=(self.theme.space.tiny, 0))
+        else:
+            self.legacy_storage_note.pack_forget()
         self.database_text.set(self.snapshot["data_directory"])
         self.update_workspace_path()
         self.company_name.set(self.snapshot["company"]["name"])
@@ -733,20 +993,30 @@ class Workbench(tk.Tk):
             else:
                 self.clear_detail()
         if not self.snapshot["company"].get("name") and not self.snapshot["company"].get("tax_id"):
-            self.status_text.set("可以直接导入发票。按额度选票前，请在“设置”填写报销公司。")
+            self.status_text.set("按额度选票前，请在「设置」填写报销公司。")
         else:
-            self.status_text.set("已就绪。自动核验通过且公司匹配的可用、已退回发票可参与选票。")
+            self.status_text.set("已就绪。")
         self.update_actions()
         self.update_connection_status()
 
     def clear_search(self):
         self.search.set("")
-        self.fill_invoices()
         self.search_entry.focus_set()
+
+    def reset_invoice_filters(self):
+        self.filter.set("全部")
+        self.search.set("")
+
+    def toggle_invoice_filter(self, target):
+        self.filter.set("全部" if self.filter.get() == target else target)
+        self.fill_invoices()
 
     def fill_invoices(self):
         query = self.search.get().strip().lower()
         active_filter = self.filter.get()
+        for target, button in self.metric_buttons.items():
+            button.configure(style="Selected.Metric.TButton" if active_filter == target else "Metric.TButton")
+        self.clear_search_button.configure(state="normal" if self.search.get() else "disabled")
         selected = self.current_id
         self.tree.delete(*self.tree.get_children())
         for item in self.invoices_by_id.values():
@@ -761,12 +1031,17 @@ class Workbench(tk.Tk):
                 continue
             status = state_label(item)
             tone = "occupied" if occupied or item.get("archived") else "error" if item.get("duplicate") else "warning" if pending else "success"
-            badge = self.theme.status_badge(status, tone)
+            from_mail = any("@" in source.partition(" / ")[0] and " / " in source
+                            and not Path(source.partition(" / ")[0]).anchor for source in item["sources"])
+            origin = "邮件" if from_mail else "本地"
+            badges = {"image": self.theme.badge_strip((status, tone), (origin, "info" if from_mail else "occupied"))}
+            if self.theme.status_font is None:
+                badges = {"text": f"{status} · {origin}"}
             documents = item["files"] or item.get("mail_xml", ())
             filename = documents[0]["name"] if documents else "待补充原件"
-            self.tree.insert("", "end", iid=item["id"], image=badge, text="" if self.theme.status_font else status,
+            self.tree.insert("", "end", iid=item["id"],
                              values=(filename, item["number"] or "待填写票号", item["date"] or "—",
-                                     yuan(item["amount_cents"]) if item["amount_cents"] else "待填写", status))
+                                     yuan(item["amount_cents"]) if item["amount_cents"] else "待填写", status), **badges)
         if selected:
             if self.tree.exists(selected):
                 self.tree.selection_set(selected)
@@ -777,12 +1052,19 @@ class Workbench(tk.Tk):
             if self.current_id:
                 self.update_review_banner()
         count, total = len(self.tree.get_children()), len(self.snapshot.get("invoices", []))
-        self.list_summary.set(f"显示 {count} / {total} 张 · 点击发票查看详情与状态" if total else "点击“导入发票文件夹”添加，发现重复副本时可选择删除。")
+        self.list_summary.set(f"显示 {count} / {total} 张" if total else INVOICE_IMPORT_GUIDE)
         if count:
-            self.empty_hint.place_forget()
+            self.empty_card.place_forget()
         else:
-            self.empty_hint.configure(text="没有匹配的发票\n\n请清空搜索或切换为“全部”。" if total else "还没有发票\n\n点击上方“导入发票文件夹”即可添加。")
-            self.empty_hint.place(relx=0.5, rely=0.45, anchor="center")
+            filtered = bool(query or active_filter != "全部")
+            for button in (self.empty_import, self.empty_clear):
+                button.pack_forget()
+            self.empty_hint.configure(text="没有匹配的发票" if filtered else "暂无发票")
+            if filtered:
+                self.empty_clear.pack(side="left")
+            else:
+                self.empty_import.pack(side="left")
+            self.empty_card.place(relx=0.5, rely=0.55, anchor="center")
 
     def mark_dirty(self, *_):
         if not self.loading and self.current_id and not self.dirty:
@@ -798,9 +1080,9 @@ class Workbench(tk.Tk):
             self.review_messages = []
             self.warning_text.set("")
             return
-        detail_title = f"{item['number'] or '字段不完整'} · {state_label(item)}"
+        detail_title = item["number"] or "待填写票号"
         if self.draft_is_filtered():
-            detail_title += " · 已被筛选隐藏"
+            detail_title += "\n已被筛选隐藏"
         if detail_title != self.details_title.get():
             self.details_title.set(detail_title)
         verification = item.get("verification", {})
@@ -813,6 +1095,11 @@ class Workbench(tk.Tk):
         title = "有未保存的核对修改" if self.dirty else "存在同票冲突" if item.get("duplicate") else "字段需要核对" if messages else "自动核验通过"
         self.warning_text.set(title + (f" · 查看 {len(messages)} 项核验提示" if messages else ""))
         tone = "error" if item.get("duplicate") else "warning" if self.dirty or not verification.get("passed") or not item.get("company_match") else "success"
+        self.detail_status.configure(text=state_label(item))
+        if item.get("reimbursement_status") in OCCUPIED_STATUSES or item.get("archived"):
+            self.detail_status.set_tone("occupied")
+        else:
+            self.detail_status.set_tone("error" if item.get("duplicate") else "warning" if messages else "success")
         background, foreground = getattr(COLORS, tone + "_bg"), getattr(COLORS, tone)
         self.review_banner.configure(background=background, foreground=foreground, activebackground=background,
                                       activeforeground=foreground, highlightbackground=background,
@@ -822,8 +1109,9 @@ class Workbench(tk.Tk):
         if self.review_messages:
             messagebox.showwarning("核验提示", "\n\n".join(self.review_messages), parent=self)
 
-    def allow_discard(self):
-        return not self.dirty or messagebox.askyesno("尚未保存", "当前字段修改尚未保存。放弃修改并继续？", parent=self)
+    def allow_discard(self, *, parent=None):
+        return not self.dirty or messagebox.askyesno("尚未保存", "当前字段修改尚未保存。放弃修改并继续？",
+                                                    parent=parent or self)
 
     def select_invoice(self, event=None):
         if self.selecting_invoice:
@@ -930,8 +1218,8 @@ class Workbench(tk.Tk):
         if self.detail_visible:
             width = self.splitter.winfo_width()
             right = min(self.theme.px(360), int(width * 0.55))
-            # 给状态、金额和滚动条保留至少 200 个逻辑像素。
-            left = min(self.theme.px(280), max(self.theme.px(200), int(width * 0.35)), width - right)
+            left = min(self.theme.px(300), max(self.theme.px(236), int(width * 0.35)), width)
+            right = min(right, width - left)
             position = self.splitter.sashpos(0)
             self.splitter.sashpos(0, max(left, min(width - right, position)))
 
@@ -940,6 +1228,7 @@ class Workbench(tk.Tk):
             self.detail_visible = False
             self.cancel_preview_render()
             self.preview_resize_position = None
+            self.preview_canvas.delete("all")
             self.splitter.forget(self.detail_pane)
 
     @staticmethod
@@ -961,6 +1250,7 @@ class Workbench(tk.Tk):
         self.cancel_preview_render()
         self.preview_image = self.preview_key = None
         self.preview_zoom = 1.0
+        self.preview_fit = True
         self.preview_resize_position = None
         self.image_reference = None
         self.preview_canvas.delete("all")
@@ -970,6 +1260,7 @@ class Workbench(tk.Tk):
         return self.preview_canvas.xview()[0], self.preview_canvas.yview()[0]
 
     def cancel_preview_render(self):
+        self.preview_generation += 1
         if self.preview_after is not None:
             self.after_cancel(self.preview_after)
             self.preview_after = None
@@ -984,14 +1275,23 @@ class Workbench(tk.Tk):
             # 在画布随外框改变尺寸之前记录位置，避免 Tk 按旧滚动范围提前限制位置。
             if resizing and self.image_reference is not None and self.preview_resize_position is None:
                 self.preview_resize_position = self.preview_scroll_position()
-            self.preview_after = self.after(100, self.render_preview)
+            generation = self.preview_generation
+            self.preview_after = self.after(100, lambda: self.render_preview() if generation == self.preview_generation else None)
 
     def preview_file_changed(self, event=None):
         self.preview_zoom = 1.0
+        self.preview_fit = True
         self.render_preview()
 
     def zoom_preview(self, factor):
+        if factor is None:
+            self.preview_fit = True
         self.preview_zoom = 1.0 if factor is None else max(0.25, min(3.0, self.preview_zoom * factor))
+        self.render_preview()
+
+    def reset_preview_zoom(self):
+        self.preview_fit = False
+        self.preview_zoom = 1.0
         self.render_preview()
 
     def render_preview(self):
@@ -1037,7 +1337,8 @@ class Workbench(tk.Tk):
                 self.preview_canvas.create_text(p(16), p(20), anchor="nw", text="此格式请使用“打开原件”查看。\n文字内容位于“提取文本”。", fill=COLORS.secondary,
                                                 font=(FONT, 10), width=max(p(100), self.preview_canvas.winfo_width() - p(32)))
                 return
-            width = max(p(100), round((self.preview_canvas.winfo_width() - p(32)) * self.preview_zoom))
+            base_width = max(p(100), self.preview_canvas.winfo_width() - p(32)) if self.preview_fit else self.preview_image.width
+            width = max(1, round(base_width * self.preview_zoom))
             image = self.preview_image.resize((width, max(1, round(width * self.preview_image.height / self.preview_image.width))), Image.Resampling.LANCZOS)
             self.image_reference = ImageTk.PhotoImage(image, master=self)
             x = max(p(16), (self.preview_canvas.winfo_width() - width) // 2)
@@ -1062,19 +1363,19 @@ class Workbench(tk.Tk):
             except (UserError, OSError) as exc:
                 messagebox.showerror("无法打开原件", str(exc), parent=self)
 
-    def task(self, description, work, done=None, *, preserve_edits=True, cancelled=None):
+    def task(self, description, work, done=None, *, preserve_edits=True, cancelled=None, connecting_mail=False,
+             failed=None):
         if self.busy:
             return
         self.busy = True
         self.task_cancelled = cancelled
+        self.connecting_mail = connecting_mail or cancelled is not None
         self.preserve_edits = preserve_edits
         self.status_text.set(description)
+        self.task_pill.configure(text="连接邮箱" if self.connecting_mail else "处理中")
         self.update_connection_status()
         self.update_actions()
-        self.progress.grid(row=0, column=1, sticky="e", padx=(self.theme.space.small, 0))
         self.progress.start(12)
-        if cancelled is not None:
-            self.cancel_task_button.grid(row=0, column=3, sticky="e", padx=(self.theme.space.small, 0))
         events = self.events
 
         def run():
@@ -1085,15 +1386,15 @@ class Workbench(tk.Tk):
             except Exception as exc:
                 if cancelled is None or not cancelled.is_set():
                     logging.exception("Operation failed: %s", description)
-                    events.put(("error", exc))
+                    events.put(("error", (exc, failed)))
         threading.Thread(target=run, daemon=True).start()
 
     def finish_task(self):
         self.busy = False
         self.task_cancelled = None
+        self.connecting_mail = False
         self.progress.stop()
-        self.progress.grid_remove()
-        self.cancel_task_button.grid_remove()
+        self.update_connection_status()
 
     def cancel_mail_connection(self):
         if self.task_cancelled is None:
@@ -1101,9 +1402,10 @@ class Workbench(tk.Tk):
         self.task_cancelled.set()
         self.events = queue.Queue()
         self.finish_task()
-        self.update_connection_status()
         self.update_actions()
         self.status_text.set("已取消邮箱连接。")
+        if self.import_dialog is not None:
+            self.import_dialog.update_mail()
 
     def _poll(self):
         try:
@@ -1115,9 +1417,13 @@ class Workbench(tk.Tk):
                 self.finish_task()
                 self.reload(discard_edits=kind == "done" and not self.preserve_edits)
                 if kind == "error":
-                    messagebox.showerror("操作未完成", str(payload), parent=self)
-                    if self.session_ok:
-                        self.status_text.set("操作未完成；请核对提示后重试。")
+                    error, callback = payload
+                    if callback:
+                        callback(error)
+                    else:
+                        messagebox.showerror("操作未完成", str(error), parent=self)
+                        if self.session_ok:
+                            self.status_text.set("操作未完成，请核对提示后重试。")
                 else:
                     result, callback = payload
                     if callback:
@@ -1127,40 +1433,95 @@ class Workbench(tk.Tk):
         self.poll_id = self.after(100, self._poll)
 
     def import_directory(self):
-        if not self.session_ok or self.busy or not self.allow_discard():
-            return
-        source = self.store.library
-        if not source:
-            source = filedialog.askdirectory(title="选择并扫描发票资料库（自动包含子文件夹）", parent=self,
-                                             initialdir=self.settings.get("last_import_directory", str(Path.home())))
-        if not source:
-            return
-        self.start_import(source)
+        self.open_import(LOCAL_MODE)
 
-    def start_import(self, source):
+    def open_import(self, mode=LOCAL_MODE):
+        if self.import_dialog is not None:
+            self.import_dialog.pages.select(self.import_dialog.pages.labels.index(mode))
+            self.import_dialog.lift()
+            return
+        if not self.session_ok or self.busy:
+            return
+        workspace = self.store.workspace
+        address = self.settings.get("mail_address", "")
+        profile = provider = None
+        notice = ""
+        if not workspace.is_dir():
+            notice = "请先在设置中选择可用的工作区。"
+        elif not address:
+            notice = "请先在「邮箱收票」设置中保存邮箱地址。"
+        if address:
+            try:
+                profile = mailbox_profile(address, self.settings.get("mail_host", ""), self.settings.get("mail_port", 993))
+                provider = MAIL_PROVIDER_NAMES.get(profile[1], profile[1])
+            except UserError as exc:
+                if not notice:
+                    notice = str(exc)
+        dialog = ImportDialog(self, mode, workspace=workspace, recent=self.settings.get("last_import_directory"),
+                              profile=profile, provider=provider, mail_notice=notice)
+        self.import_dialog = dialog
+        if self.mailbox is not None and self.mailbox.profile == profile:
+            dialog.update_mail(folders=self.mail_folders)
+
+        def closed(event):
+            if event.widget is dialog:
+                self.import_dialog = None
+                if dialog.connecting:
+                    self.cancel_mail_connection()
+
+        dialog.bind("<Destroy>", closed, add="+")
+
+    def edit_import_settings(self, dialog):
+        workspace = self.store.workspace
+        dialog.destroy()
+        if not workspace.is_dir():
+            self.open_settings(GENERAL_SETTINGS)
+        else:
+            self.open_settings(MAIL_SETTINGS)
+            if dialog.mail_notice:
+                if dialog.profile is None and self.settings.get("mail_address"):
+                    self.mail_advanced.set_expanded(True)
+                self._mail_feedback(dialog.mail_notice, tone="warning")
+            self.mail_address_entry.focus_set()
+
+    def edit_archive_target(self, dialog):
+        dialog.destroy()
+        self.open_settings(GENERAL_SETTINGS)
+
+    def start_import(self, source=None, *, files=(), scan_workspace=False):
         if not self.session_ok or self.busy:
             return
         store, revision = self.store, self.snapshot["revision"]
         self.pages.select(0)
-        self.current_id = None
         self.clear_detail()
-        self.search.set("")
-        self.filter.set("全部")
+        self.reset_invoice_filters()
+        self.dismiss_import_result()
         def work():
-            import_revision = revision
-            if not store.library:
-                import_revision = store.set_library(revision, source)
-            return import_directory(store, import_revision, source, lambda msg: self.events.put(("progress", msg)))
-        self.task("正在读取发票…", work, self.import_done)
+            def progress(message):
+                self.events.put(("progress", message))
+
+            if files:
+                return store.import_files(revision, files, progress)
+            return import_directory(store, revision, source, progress, scan_workspace=scan_workspace)
+        self.task("正在读取发票…", work, self.import_done, failed=self.import_failed)
 
     def import_done(self, report):
         text = import_summary(report)
-        if report["kind"] == "mail":
-            self.open_import_history(report)
-        elif report["errors"]:
-            messagebox.showwarning("部分文件未导入", text + "\n请从「导入发票」打开「导入记录」查看完整结果。", parent=self)
+        issues = sum(row["result"] == "error" or bool(row.get("invoice_id") and row.get("detail"))
+                     for row in report["items"])
+        banner = f"本次新增 {report['imported']} 张 · 自动归并 {report['merged']} 份原件 · {issues} 条异常"
         if not report["scanned"] and report["kind"] == "directory":
-            text = "没有找到支持的文件。支持 PDF、XML、PNG、JPG、OFD 和 EML，自动包含子文件夹。"
+            text = banner = "没有找到支持的文件。"
+        elif not report["scanned"] and not report["items"]:
+            banner = "所选日期范围内没有邮件。"
+        if report["kind"] in {"directory", "files"}:
+            recent = report.get("source_directory", report["source"])
+            self.settings = self.settings | {"last_import_directory": recent}
+            try:
+                self._save_settings()
+            except OSError:
+                logging.exception("无法保存最近导入目录")
+        self.show_import_result(banner, "warning" if issues else "success", report)
         self.status_text.set(text)
         children = self.tree.get_children()
         if children:
@@ -1175,6 +1536,23 @@ class Workbench(tk.Tk):
                 self.task("正在整理重复文件…", lambda: remove_duplicate_files(store, revision, report),
                           lambda count: self.status_text.set(text + f" · 已删除 {count} 个重复副本"))
 
+    def dismiss_import_result(self):
+        self.last_import_report = None
+        self.import_banner.grid_remove()
+
+    def show_import_result(self, text, tone, report=None):
+        self.last_import_report = report
+        self.import_result.configure(text=text, style=f"{tone}.SettingsFeedback.TLabel")
+        if report:
+            self.import_result_link.pack(side="right", padx=(self.theme.space.small, 0), before=self.import_result)
+        else:
+            self.import_result_link.pack_forget()
+        self.import_banner.grid()
+
+    def import_failed(self, error):
+        self.show_import_result(str(error), "error")
+        self.status_text.set("导入未完成。")
+
     def open_import_history(self, report=None):
         if not self.store:
             return
@@ -1187,7 +1565,102 @@ class Workbench(tk.Tk):
             reports.insert(0, report)
         ImportHistory(self, reports, report["id"] if report else None)
 
+    def locate_imported_invoice(self, invoice_id, *, parent):
+        if not self.session_ok or self.busy or invoice_id not in self.invoices_by_id:
+            return False
+        if self.current_id != invoice_id and not self.allow_discard(parent=parent):
+            return False
+        self.pages.select(0)
+        self.reset_invoice_filters()
+        self.tree.selection_set(invoice_id)
+        self.tree.focus(invoice_id)
+        self.tree.see(invoice_id)
+        if self.current_id != invoice_id:
+            self.load_invoice(self.invoices_by_id[invoice_id])
+        else:
+            self.show_detail()
+        self.details.select(0)
+        return True
+
+    def _saved_mail_fields(self):
+        return (
+            self.settings.get("mail_address", ""),
+            self.settings.get("mail_host", ""),
+            str(self.settings.get("mail_port", 993)),
+            self.settings.get("mail_client_id", ""),
+            ", ".join(self.settings.get("mail_blocked_domains", [])),
+        )
+
+    def _load_mail_fields(self):
+        for field, value in zip(self.mail_fields, self._saved_mail_fields()):
+            field.set(value)
+
+    def _refresh_mail_provider(self, *_):
+        address = self.mail_address.get().strip()
+        host = self.mail_host.get().strip()
+        port = self.mail_port.get().strip()
+        local, _, domain = address.rpartition("@")
+        provider = "输入邮箱地址后识别 IMAP 服务器"
+        tone = "occupied"
+        kind = None
+        if local and "." in domain:
+            try:
+                default = mailbox_profile(address)
+            except UserError:
+                default = None
+            try:
+                profile = mailbox_profile(address, host, port) if host or port not in ("", "993") else default
+            except UserError:
+                profile = None
+            provider_host = default[1] if default else ""
+            effective = profile or default
+            if effective and effective[1] == OUTLOOK_IMAP_HOST:
+                provider, tone = "已识别：Outlook · OAuth2 登录", "info"
+            elif provider_host:
+                _, server, tls_port = profile or default
+                prefix = "自定义" if profile and profile != default else "默认"
+                name = MAIL_PROVIDER_NAMES.get(provider_host, provider_host)
+                provider = f"已识别：{name} · {prefix} {server}:{tls_port}"
+                tone = "info"
+            elif profile:
+                _, server, tls_port = profile
+                provider, tone = f"其他邮箱 · {server}:{tls_port}", "info"
+            else:
+                provider, tone = "其他邮箱 · 请核对地址和 IMAP 配置", "warning"
+            kind = "known" if provider_host else "other"
+        self.mail_provider_pill.configure(text=provider)
+        self.mail_provider_pill.set_tone(tone)
+        if kind or not address:
+            other = kind == "other"
+            if other != (self._mail_provider_kind == "other"):
+                self.mail_advanced.set_expanded(other)
+            self._mail_provider_kind = kind
+
+    def _mail_fields_changed(self, *_):
+        values = tuple(field.get() for field in self.mail_fields)
+        if values == self._saved_mail_fields():
+            self._mail_feedback(MAIL_SETTINGS_HINT)
+        else:
+            self._mail_feedback("有未保存的收票设置", tone="warning")
+
+    def _mail_feedback(self, text, *, tone="occupied"):
+        self.mail_feedback.configure(text=text, style=f"{tone}.SettingsFeedback.TLabel")
+
+    def _update_mail_session(self):
+        if self.connecting_mail:
+            text, tone = "正在连接邮箱…", "info"
+        elif self.mailbox is not None:
+            text, tone = "已连接", "success"
+        else:
+            text, tone = "未连接", "occupied"
+        self.mail_session_pill.configure(text=text)
+        self.mail_session_pill.set_tone(tone)
+        can_clear = self.mailbox is not None and not self.busy
+        self.mail_clear_button.configure(state="normal" if can_clear else "disabled")
+
     def save_mail_settings(self):
+        if self.busy:
+            return
         try:
             address = self.mail_address.get().strip()
             host = self.mail_host.get().strip()
@@ -1200,78 +1673,90 @@ class Workbench(tk.Tk):
                 client_id = validate_client_id(client_id)
             blocked = domain_list(self.mail_blocked.get())
         except UserError as exc:
-            messagebox.showerror("收票设置无效", str(exc), parent=self)
+            self.mail_advanced.set_expanded(True)
+            self._mail_feedback(str(exc), tone="error")
             return
         profile_settings = dict(mail_address=address, mail_host=host, mail_port=port, mail_client_id=client_id)
         settings = self.settings | profile_settings | {"mail_blocked_domains": blocked}
         try:
             self._save_settings(settings)
         except OSError:
-            messagebox.showerror("无法保存收票设置", f"无法写入本地设置文件。\n{self.settings_file}", parent=self)
+            self._mail_feedback(f"无法写入本地设置文件。\n{self.settings_file}", tone="error")
             return
         if any(self.settings.get(key, "") != value for key, value in profile_settings.items()):
-            self.disconnect_mail()
+            self.mailbox = None
+            self.mail_folders = ()
         self.settings = settings
-        self.mail_client_id.set(client_id)
+        self._load_mail_fields()
+        self._update_mail_session()
+        self._mail_feedback("✓  收票设置已保存", tone="success")
         self.status_text.set("已保存收票设置。")
 
     def disconnect_mail(self):
         self.mailbox = None
+        self.mail_folders = ()
+        self._update_mail_session()
+        self._mail_feedback("已清除本次邮箱登录凭证", tone="success")
         self.status_text.set("已清除本次邮箱登录凭证。")
 
-    def open_mail(self):
-        if not self.session_ok or self.busy or not self.allow_discard():
+    def connect_import_mail(self, dialog):
+        if not self.session_ok or self.busy or not dialog.profile:
             return
-        if not self.store.library or not self.store.library.is_dir():
-            self.pages.select(2)
-            messagebox.showinfo("选择发票资料库", "请在设置中选择接收邮件原件的发票资料库。", parent=self)
-            return
-        address = self.settings.get("mail_address")
-        if not address:
-            self.pages.select(2)
-            messagebox.showinfo("填写收票设置", "请在设置中保存邮箱地址和 IMAP 配置，再开始收票。", parent=self)
-            return
-        try:
-            profile = mailbox_profile(address, self.settings.get("mail_host", ""), self.settings.get("mail_port", 993))
-        except UserError as exc:
-            messagebox.showerror("收票设置无效", str(exc), parent=self)
-            return
-
-        mailbox = self.mailbox
-        outlook = profile[1] == OUTLOOK_IMAP_HOST
-        if not mailbox and outlook:
+        profile = dialog.profile
+        address, host, _ = profile
+        outlook = host == OUTLOOK_IMAP_HOST
+        if self.mailbox and self.mailbox.profile == profile:
+            mailbox = self.mailbox
+        elif outlook:
             try:
                 client_id = configured_client_id(APP_ROOT, local_client_id=self.settings.get("mail_client_id", ""))
                 oauth = OutlookOAuth(address, client_id)
             except UserError as exc:
-                self.pages.select(2)
-                messagebox.showerror("Outlook 授权设置", str(exc), parent=self)
+                dialog.show_error(str(exc))
                 return
             mailbox = IMAPMailbox(profile, outlook_oauth=oauth)
-        if not mailbox:
-            password = simpledialog.askstring("邮箱登录", f"{address}\n请输入邮箱的客户端授权码或应用专用密码。",
-                                              show="*", parent=self)
+        else:
+            credential = MailCredentialDialog(dialog, address, MAIL_PROVIDER_NAMES.get(host))
+            self.wait_window(credential)
+            if not dialog.winfo_exists():
+                return
+            dialog.grab_set()
+            password = credential.result
             if not password:
+                dialog.confirm.focus_set()
                 return
             mailbox = IMAPMailbox(profile, password)
         self.mailbox = None
+        self.mail_folders = ()
+        login_prompt = "请在浏览器完成 Microsoft 授权" if outlook else "正在连接邮箱…"
+        dialog.update_mail(connecting=True, prompt=login_prompt)
 
         def choose(folders):
             self.mailbox = mailbox
-            MailScopeDialog(self, folders, self.start_mail_import)
+            self.mail_folders = folders
+            self._update_mail_session()
+            dialog.update_mail(folders=folders)
+            self.status_text.set("邮箱已连接。")
 
-        if outlook:
-            cancelled = threading.Event()
-            self.task("正在连接 Outlook IMAP。如浏览器打开，请完成 Microsoft 授权。",
-                      lambda: mailbox.folders(cancelled=cancelled), choose, cancelled=cancelled)
-        else:
-            self.task("正在连接 IMAP 邮箱…", mailbox.folders, choose)
+        def failed(error):
+            dialog.update_mail(message=str(error))
+            self.status_text.set("邮箱连接未完成。")
+
+        cancelled = threading.Event()
+        self.task(login_prompt, lambda: mailbox.folders(cancelled=cancelled), choose,
+                  cancelled=cancelled, failed=failed)
 
     def start_mail_import(self, folder, source, bounds):
-        store, revision = self.store, self.snapshot["revision"]
-        if not store.library or not store.library.is_dir():
-            messagebox.showerror("发票资料库不可用", "请在设置中选择可访问的发票资料库。", parent=self)
+        if not self.session_ok or self.busy or self.mailbox is None:
             return
+        store, revision = self.store, self.snapshot["revision"]
+        self.pages.select(0)
+        if not store.workspace.is_dir():
+            self.import_failed("请在设置中选择可访问的工作区存储位置。")
+            return
+        self.clear_detail()
+        self.reset_invoice_filters()
+        self.dismiss_import_result()
         mailbox = self.mailbox
         blocked = self.settings.get("mail_blocked_domains", [])
 
@@ -1279,7 +1764,7 @@ class Workbench(tk.Tk):
             return import_mailbox(store, revision, mailbox, folder, source, bounds, blocked,
                                   lambda message: self.events.put(("progress", message)))
 
-        self.task("正在查找发票邮件…", work, self.import_done)
+        self.task("正在查找发票邮件…", work, self.import_done, failed=self.import_failed)
 
     def recognize_again(self):
         item = self.selected_item()
@@ -1306,8 +1791,8 @@ class Workbench(tk.Tk):
             return
         directory = self.store.root
         prompt = (f"系统数据库：{directory}\n\n"
-                  "将清空发票索引、报销批次、导入历史、公司信息和邮箱设置。\n"
-                  "发票资料库路径、原件和已导出的文件会保留。\n\n"
+                  "清空发票索引、报销批次、导入记录和设置。\n"
+                  "保留工作区位置、原件和导出文件。\n\n"
                   "此操作无法撤销。确认恢复初始化？")
         if not messagebox.askyesno("恢复初始化", prompt, parent=self, icon="warning", default="no"):
             return
@@ -1319,20 +1804,18 @@ class Workbench(tk.Tk):
             return settings
         def done(settings):
             self.settings = settings
-            self.disconnect_mail()
-            self.mail_address.set("")
-            self.mail_host.set("")
-            self.mail_port.set("993")
-            self.mail_client_id.set("")
-            self.mail_blocked.set("")
+            self.mailbox = None
+            self.mail_folders = ()
+            self.dismiss_import_result()
+            self._load_mail_fields()
+            self._update_mail_session()
             self.current_id = None
             self.clear_detail()
             self.search.set("")
             self.filter.set("全部")
             self.fill_invoices()
             self.fill_batches()
-            self.set_text(self.batch_info, "")
-            self.pages.select(2)
+            self.open_settings(SYSTEM_SETTINGS)
             self.status_text.set("系统数据库已恢复初始化。")
         self.task("正在恢复初始化…", work, done, preserve_edits=False)
 
@@ -1370,7 +1853,7 @@ class Workbench(tk.Tk):
         if not self.store or self.busy or not self.allow_discard():
             return
         if not self.snapshot["company"].get("name") and not self.snapshot["company"].get("tax_id"):
-            self.pages.select(2)
+            self.open_settings(GENERAL_SETTINGS)
             messagebox.showinfo("先设置公司", "请先填写购买方抬头或税号。", parent=self)
             return
         SelectionDialog(self)
@@ -1378,12 +1861,14 @@ class Workbench(tk.Tk):
     def fill_batches(self):
         previous = self.batch_tree.selection()
         self.batch_tree.delete(*self.batch_tree.get_children())
-        for batch in reversed(self.snapshot.get("batches", [])):
+        batches = self.snapshot.get("batches", [])
+        for batch in reversed(batches):
             created = datetime.fromisoformat(batch["created"]).astimezone().strftime("%Y-%m-%d %H:%M")
             self.batch_tree.insert("", "end", iid=batch["id"], values=(created, len(batch["items"]), yuan(batch["target_cents"]), yuan(batch["total_cents"]), yuan(batch["declared_cents"])))
         if previous and self.batch_tree.exists(previous[0]):
             self.batch_tree.selection_set(previous[0])
-            self.show_batch()
+        self.batch_summary.set(f"共 {len(batches)} 个批次" if batches else "暂无批次。可在「发票资料」按额度选票。")
+        self.show_batch()
 
     def selected_batch(self):
         selection = self.batch_tree.selection()
@@ -1391,15 +1876,34 @@ class Workbench(tk.Tk):
 
     def show_batch(self, event=None):
         batch = self.selected_batch()
+        self.update_batch_export()
+        info = self.batch_info
+        info.configure(state="normal")
+        info.delete("1.0", "end")
         if batch:
-            lines = []
-            for item in batch["items"]:
-                live = self.invoices_by_id.get(item["id"], {})
-                status = INVOICE_STATUS.get(live.get("reimbursement_status"), "历史记录")
-                membership = "本批次占用" if live.get("active_batch_id") == batch["id"] else "已释放本批次占用"
-                lines.append(f"{item['number']}  {item['date']}  ¥{yuan(item['amount_cents'])}  当前：{status}（{membership}）")
-            text = f"批次：{batch['id']}\n公司：{batch['company']['name']}   税号：{batch['company']['tax_id']}\n" + "\n".join(lines)
-            self.set_text(self.batch_info, text)
+            company = batch["company"]
+            info.insert("end", "批次编号  ", "caption", batch["id"], "identifier", "\n", (),
+                        "报销公司  ", "caption", company["name"] or "—", (),
+                        "    税号  ", "caption", company["tax_id"] or "—", "identifier")
+        info.configure(state="disabled")
+        self.batch_items.delete(*self.batch_items.get_children())
+        page = self.batch_details.master
+        if not batch:
+            self.batch_details.grid_remove()
+            page.rowconfigure(2, weight=0, minsize=0)
+            return
+        for item in batch["items"]:
+            live = self.invoices_by_id.get(item["id"], {})
+            status = INVOICE_STATUS.get(live.get("reimbursement_status"), "历史记录")
+            membership = "占用中" if live.get("active_batch_id") == batch["id"] else "已释放"
+            self.batch_items.insert("", "end", values=(item["number"], item["date"], yuan(item["amount_cents"]),
+                                                        status, membership))
+        page.rowconfigure(2, weight=3, minsize=self.theme.px(135))
+        self.batch_details.grid()
+
+    def update_batch_export(self):
+        enabled = self.session_ok and not self.busy and bool(self.batch_tree.selection())
+        self.batch_export_button.configure(state="normal" if enabled else "disabled")
 
     def export_batch(self):
         batch = self.selected_batch()
@@ -1415,11 +1919,12 @@ class Workbench(tk.Tk):
             if built.resolve() != Path(dest).resolve():
                 shutil.copy2(built, dest)
             return dest
-        self.task("校验原票并生成报销材料…", work, lambda p: messagebox.showinfo("导出完成", f"已保存：\n{p}\n\n报销状态保持不变。", parent=self))
+        self.task("正在导出报销材料…", work,
+                  lambda p: messagebox.showinfo("导出完成", f"已保存到\n{p}", parent=self))
 
     def close_app(self):
         if self.busy and self.task_cancelled is None:
-            messagebox.showinfo("正在处理", "请等待当前处理完成后关闭窗口，确保发票记录保存完整。", parent=self)
+            messagebox.showinfo("正在处理", "请等待当前操作完成后关闭窗口。", parent=self)
             return
         if not self.allow_discard():
             return

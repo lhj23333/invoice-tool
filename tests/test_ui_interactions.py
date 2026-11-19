@@ -1,3 +1,5 @@
+from contextlib import ExitStack
+from datetime import date, timedelta
 import os
 from pathlib import Path
 import tempfile
@@ -6,12 +8,23 @@ import tkinter as tk
 from tkinter import ttk
 import unittest
 
-from invoice_workbench.gui import Workbench
+from invoice_workbench.gui import GENERAL_SETTINGS, MAIL_SETTINGS, SYSTEM_SETTINGS, Workbench
+from invoice_workbench.import_dialogs import ImportHistory, LOCAL_MODE, MAIL_MODE, MailCredentialDialog
 from invoice_workbench.selection import SelectionDialog
 from invoice_workbench.store import uid
-from invoice_workbench.theme import COLORS, enable_dpi_awareness
+from invoice_workbench.theme import COLORS, Theme, enable_dpi_awareness
+from invoice_workbench.widgets import ScrollableFrame, SegmentedControl, StatusPill
 from .helpers import BUYER, TAX, write_invoice
 from . import test_review_fixes
+
+
+def dialog_button(panel, text):
+    for widget in panel.winfo_children():
+        if isinstance(widget, ttk.Button) and widget.cget("text") == text:
+            return widget
+        if isinstance(widget, ttk.Frame) and (button := dialog_button(widget, text)):
+            return button
+    return None
 
 
 class InteractionTests(unittest.TestCase):
@@ -77,6 +90,187 @@ class InteractionTests(unittest.TestCase):
         self.app.clear_search()
         self.app.filter_control.buttons[0].invoke()
         self.assertEqual(len(self.app.tree.get_children()), 2)
+
+    def test_metrics_and_empty_actions_share_invoice_filters(self):
+        app = self.app
+        app.metric_buttons["可用"].invoke()
+        self.assertEqual(app.filter.get(), "可用")
+        self.assertTrue(app.filter_control.buttons[2].instate(["selected"]))
+        app.metric_buttons["可用"].invoke()
+        self.assertEqual(app.filter.get(), "全部")
+        app.metric_buttons["已占用"].invoke()
+        app.update()
+        self.assertFalse(app.tree.get_children())
+        self.assertTrue(app.empty_clear.winfo_ismapped())
+        app.empty_clear.invoke()
+        app.search_entry.insert(0, "不存在的发票")
+        self.assertFalse(app.tree.get_children())
+        self.assertTrue(app.clear_search_button.instate(["!disabled"]))
+        app.clear_search_button.invoke()
+        self.assertEqual(len(app.tree.get_children()), 2)
+        self.assertTrue(app.clear_search_button.instate(["disabled"]))
+
+    def test_mail_credential_dialog_masks_input_and_releases_modal_grab(self):
+        dialog = MailCredentialDialog(self.app, "name@qq.com", "QQ 邮箱")
+        self.app.update()
+        self.assertIs(self.app.grab_current(), dialog)
+        self.assertEqual(dialog.entry.cget("show"), "*")
+        dialog_button(dialog.actions, "连接邮箱").invoke()
+        self.app.update()
+        self.assertTrue(dialog.error.winfo_ismapped())
+
+        dialog.entry.insert(0, "授权码输入测试")
+        dialog.visibility.invoke()
+        self.assertEqual(dialog.entry.cget("show"), "")
+        dialog.visibility.invoke()
+        self.assertEqual(dialog.entry.cget("show"), "*")
+        dialog.entry.focus_force()
+        self.app.update()
+        dialog.entry.event_generate("<Return>")
+        self.assertEqual(dialog.result, "授权码输入测试")
+        self.assertFalse(dialog.winfo_exists())
+        self.assertIsNone(self.app.grab_current())
+
+    def test_cancel_authorization_returns_focus_to_unified_import_dialog(self):
+        app = self.app
+        app.store.set_library(app.snapshot["revision"], self.root / "source")
+        app.reload()
+        app.mail_address.set("name@qq.com")
+        app.save_mail_settings()
+        app.open_import(MAIL_MODE)
+        dialog = app.import_dialog
+        grabs = []
+
+        def dismiss_credential():
+            credential = next((window for window in dialog.winfo_children() if isinstance(window, MailCredentialDialog)), None)
+            if credential is None:
+                dialog.destroy()
+                return
+            grabs.append(app.grab_current() is credential)
+            dialog_button(credential.actions, "取消").invoke()
+
+        dialog.after(25, dismiss_credential)
+        dialog.confirm.invoke()
+        app.update()
+        self.assertEqual(grabs, [True])
+        self.assertIs(app.grab_current(), dialog)
+        self.assertEqual(dialog.confirm.cget("text"), "连接邮箱")
+        self.assertFalse(app.busy)
+        dialog.cancel.invoke()
+
+    def test_mail_scope_presets_manual_dates_and_dismissal(self):
+        def open_scope():
+            self.app.open_import(MAIL_MODE)
+            dialog = self.app.import_dialog
+            self.app.update()
+            self.assertIs(self.app.grab_current(), dialog)
+            return dialog
+
+        dialog = open_scope()
+        today = date.today()
+        presets = {button.cget("text"): button for button in dialog.presets.buttons}
+        presets["近 30 天"].invoke()
+        self.assertEqual(dialog.start_date.get(), (today - timedelta(days=29)).isoformat())
+        presets["本月"].invoke()
+        self.assertEqual(dialog.start_date.get(), today.replace(day=1).isoformat())
+        presets["近 7 天"].invoke()
+        self.assertEqual(dialog.start_date.get(), (today - timedelta(days=6)).isoformat())
+        self.assertEqual(dialog.end_date.get(), today.isoformat())
+        first = (today - timedelta(days=2)).isoformat()
+        dialog.start_date.set(first)
+        self.assertEqual(dialog.presets.variable.get(), "自定义")
+        dialog.pages.control.buttons[1].invoke()
+        self.app.update()
+        self.assertEqual(dialog.pages.variable.get(), LOCAL_MODE)
+        self.assertTrue(dialog.choose_directory.winfo_ismapped())
+        dialog.pages.control.buttons[0].invoke()
+        self.app.update()
+        self.assertEqual(dialog.start_date.get(), first)
+        dialog.cancel.invoke()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertIsNone(self.app.grab_current())
+
+        dialog = open_scope()
+        dialog.focus_force()
+        self.app.update()
+        dialog.event_generate("<Escape>")
+        self.assertFalse(dialog.winfo_exists())
+        self.assertIsNone(self.app.import_dialog)
+
+    def test_date_fields_handle_wheel_without_scrolling_the_import_panel(self):
+        app = self.app
+        app.open_import(MAIL_MODE)
+        dialog = app.import_dialog
+        p = app.theme.px
+        dialog.minsize(1, 1)
+        dialog.geometry(f"{p(530)}x{p(350)}")
+        app.update()
+        form = next(widget for widget in dialog.pages.frames[0].winfo_children() if isinstance(widget, ScrollableFrame))
+        form.canvas.yview_moveto(1)
+        app.update()
+        position = form.canvas.yview()
+        self.assertGreater(position[0], 0)
+        start, end = dialog.date_entries
+        today = date.fromisoformat(dialog.today)
+        start.event_generate("<MouseWheel>", delta=120)
+        end.event_generate("<MouseWheel>", delta=-240)
+        app.update()
+        self.assertEqual(dialog.start_date.get(), (today - timedelta(days=5)).isoformat())
+        self.assertEqual(dialog.end_date.get(), (today - timedelta(days=2)).isoformat())
+        self.assertEqual(dialog.presets.variable.get(), "自定义")
+        self.assertEqual(form.canvas.yview(), position)
+
+        end.delete(0, "end")
+        end.insert(0, "2026-13-01")
+        end.event_generate("<MouseWheel>", delta=120)
+        self.assertEqual(end.get(), "2026-13-01")
+        dialog.presets.buttons[0].invoke()
+        self.assertEqual(dialog.end_date.get(), dialog.today)
+        form.canvas.event_generate("<MouseWheel>", delta=120)
+        app.update()
+        self.assertLess(form.canvas.yview()[0], position[0])
+        self.assertEqual(dialog.end_date.get(), dialog.today)
+        dialog.cancel.invoke()
+
+    def test_import_history_filters_real_report_and_keeps_actions_in_sync(self):
+        sample = Path(__file__).resolve().parents[1] / "samples" / "sample-04.xml"
+        source = self.root / "source"
+        (source / sample.name).write_bytes(sample.read_bytes())
+        store = self.app.store
+        report = store.import_folder(store.data["revision"], source)
+        self.app.reload()
+        self.app.open_import_history(report)
+        dialog = next(window for window in self.app.winfo_children() if isinstance(window, ImportHistory))
+        self.app.update()
+        tree = dialog.tree
+        self.assertEqual(len(tree.get_children()), len(report["items"]))
+        filters = {button.cget("text"): button for button in dialog.filters.buttons}
+        filters["本地导入"].invoke()
+        self.assertIn(report["id"], dialog.batch_tree.get_children())
+        dialog.search.set(sample.name)
+        imported = tuple(str(i) for i, row in enumerate(report["items"]) if row["result"] == "imported")
+        self.assertTrue(imported)
+        self.assertLess(len(imported), len(report["items"]))
+        self.assertEqual(tree.get_children(), imported)
+        self.assertEqual(tree.selection(), (imported[0],))
+        self.assertTrue(tree.item(imported[0], "image"))
+        self.assertTrue(dialog.open_mail_button.instate(["disabled"]))
+
+        filters["邮箱收票"].invoke()
+        self.assertFalse(tree.get_children())
+        self.assertFalse(tree.selection())
+        self.assertTrue(dialog.open_mail_button.instate(["disabled"]))
+        filters["全部"].invoke()
+        dialog.search.set("")
+        self.assertEqual(len(tree.get_children()), len(report["items"]))
+        tree.selection_set(imported[0])
+        self.app.update()
+        self.app.search.set("不存在的发票")
+        self.app.filter.set("已占用")
+        dialog.locate_button.invoke()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.app.current_id, report["items"][int(imported[0])]["invoice_id"])
+        self.assertEqual((self.app.search.get(), self.app.filter.get()), ("", "全部"))
 
     def test_filter_clears_clean_details_when_the_invoice_leaves_the_list(self):
         tree = self.app.tree
@@ -412,6 +606,78 @@ class InteractionTests(unittest.TestCase):
 
 
 class DpiLayoutTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "需要 Windows Tk 绘制")
+    def test_capsule_and_search_backgrounds_are_continuous_at_200_percent(self):
+        from ctypes import WinDLL, wintypes
+
+        user = WinDLL("user32")
+        user.GetDC.argtypes = (wintypes.HWND,)
+        user.GetDC.restype = wintypes.HDC
+        user.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+        gdi = WinDLL("gdi32")
+        gdi.GetPixel.argtypes = (wintypes.HDC, wintypes.INT, wintypes.INT)
+        gdi.GetPixel.restype = wintypes.DWORD
+        enable_dpi_awareness()
+        root = tk.Tk()
+        previous = root.tk.call("tk", "scaling")
+        self.addCleanup(root.destroy)
+        self.addCleanup(root.tk.call, "tk", "scaling", previous)
+        root.tk.call("tk", "scaling", 2 * 96 / 72)
+        theme = Theme(root)
+        root.geometry("800x730+0+0")
+        plain = SegmentedControl(root, ("全部", "待核对"), theme=theme)
+        plain.pack(fill="x")
+        capsule = SegmentedControl(root, (MAIL_MODE, LOCAL_MODE), theme=theme, capsule=True)
+        capsule.pack(fill="x", pady=theme.space.small)
+        controls = ttk.Frame(root)
+        controls.pack(fill="x")
+        presets = SegmentedControl(controls, ("近 7 天", "近 30 天", "本月", "自定义"), theme=theme, capsule=True)
+        presets.pack(side="left")
+        capsule.buttons[0].state(["focus"])
+        inset = theme.px(2)
+        samples = [(plain.buttons[1], COLORS.sidebar, inset), (capsule, COLORS.occupied_bg, inset),
+                   (capsule.buttons[1], COLORS.occupied_bg, inset), (capsule.buttons[0], COLORS.secondary, 0),
+                   (presets.buttons[1], COLORS.occupied_bg, inset)]
+        for tone in ("occupied", "info", "success", "warning", "error"):
+            label = StatusPill(root, tone=tone, text="状态提示", anchor="center")
+            label.pack(fill="x", pady=theme.space.tiny)
+            samples.append((label, getattr(COLORS, f"{tone}_bg"), inset))
+        for tone in ("occupied", "warning"):
+            action = ttk.Button(root, text="操作", style=f"{tone}.ActionPill.TButton")
+            action.pack(fill="x", pady=theme.space.tiny)
+            samples.append((action, getattr(COLORS, f"{tone}_bg"), inset))
+        search = ttk.Frame(controls, style="Surface.TFrame")
+        search.pack(side="right", fill="x", expand=True, padx=(theme.space.small, 0))
+        entry = ttk.Entry(search, width=8, style="Search.TEntry")
+        entry.pack(side="left", fill="x", expand=True)
+        clear = ttk.Button(search, text="×", style="SearchClear.TButton", state="disabled")
+        clear.pack(side="right", fill="y")
+        root.update()
+        for widget, background, y in samples:
+            with self.subTest(style=widget.cget("style")):
+                hwnd = widget.winfo_id()
+                dc = user.GetDC(hwnd)
+                self.assertTrue(dc)
+                try:
+                    width = widget.winfo_width()
+                    expected = int.from_bytes(bytes.fromhex(background[1:]), "little")
+                    pixels = [gdi.GetPixel(dc, x, y) for x in range(width // 4, 3 * width // 4)]
+                    self.assertEqual(set(pixels), {expected})
+                finally:
+                    user.ReleaseDC(hwnd, dc)
+        for widget, background in ((plain.buttons[0], COLORS.sidebar), (capsule.buttons[0], COLORS.occupied_bg),
+                                   (entry, COLORS.surface), (clear, COLORS.surface)):
+            self.assertTrue(widget.winfo_viewable(), str(widget))
+            hwnd = widget.winfo_id()
+            dc = user.GetDC(hwnd)
+            self.assertTrue(dc)
+            try:
+                expected = int.from_bytes(bytes.fromhex(background[1:]), "little")
+                self.assertEqual(gdi.GetPixel(dc, 0, 0), expected, str(widget))
+                self.assertEqual(gdi.GetPixel(dc, widget.winfo_width() - 1, 0), expected, str(widget))
+            finally:
+                user.ReleaseDC(hwnd, dc)
+
     def assert_inside(self, widget, ancestor):
         self.assertTrue(widget.winfo_ismapped(), str(widget))
         left = widget.winfo_rootx() - ancestor.winfo_rootx()
@@ -425,6 +691,123 @@ class DpiLayoutTests(unittest.TestCase):
         row = tree.bbox(tree.get_children()[0])
         self.assertTrue(row, str(tree))
         self.assertLessEqual(row[1] + row[3], tree.winfo_height(), str(tree))
+
+    def test_mail_settings_remap_during_the_first_layout_pass(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            enable_dpi_awareness()
+            display = tk.Tk()
+            display.withdraw()
+            previous = display.tk.call("tk", "scaling")
+            cleanup.callback(display.destroy)
+            cleanup.callback(display.tk.call, "tk", "scaling", previous)
+            display.tk.call("tk", "scaling", 2 * 96 / 72)
+            root = Path(directory)
+            app = Workbench(root / "workspace", root / "settings.json")
+            cleanup.callback(app.close_app)
+            app.minsize(1, 1)
+            app.geometry("2160x1280+0+0")
+            app.update()
+            app.open_settings(MAIL_SETTINGS)
+            app.mail_advanced.set_expanded(True)
+            app.update()
+
+            tabs = app.settings_pages
+            mail_page = tabs.frames[tabs.labels.index(MAIL_SETTINGS)]
+            form = next(widget for widget in mail_page.winfo_children() if isinstance(widget, ScrollableFrame))
+            system_button = tabs.control.buttons[tabs.labels.index(SYSTEM_SETTINGS)]
+            mail_button = tabs.control.buttons[tabs.labels.index(MAIL_SETTINGS)]
+            wide = form.canvas.winfo_width()
+            self.assertEqual(app.mail_provider_pill.grid_info()["row"], 0)
+            form.canvas.yview_moveto(0.2)
+            app.update()
+            position = form.canvas.yview()
+            self.assertGreater(position[0], 0)
+
+            system_button.invoke()
+            app.update()
+            self.assertFalse(form.content.winfo_viewable())
+            mail_button.invoke()
+            app.update_idletasks()
+            self.assertTrue(form.content.winfo_viewable())
+            self.assertTrue(app.mail_address_entry.winfo_viewable())
+            self.assertEqual(form.canvas.yview(), position)
+            self.assert_inside(app.mail_save_button, mail_page)
+
+            app.nav_buttons[0].invoke()
+            app.geometry("1380x800+0+0")
+            app.update()
+            app.nav_buttons[2].invoke()
+            app.update_idletasks()
+            self.assertTrue(form.content.winfo_viewable())
+            self.assertLess(form.canvas.winfo_width(), wide)
+            self.assertEqual(form.content.winfo_width(), form.canvas.winfo_width())
+            self.assertEqual(app.mail_provider_pill.grid_info()["row"], 1)
+            self.assert_inside(app.mail_save_button, mail_page)
+
+    def test_invoice_intake_and_history_at_requested_window_sizes(self):
+        samples = Path(__file__).resolve().parents[1] / "samples"
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            enable_dpi_awareness()
+            display = tk.Tk()
+            display.withdraw()
+            previous = display.tk.call("tk", "scaling")
+            cleanup.callback(display.destroy)
+            cleanup.callback(display.tk.call, "tk", "scaling", previous)
+            display.tk.call("tk", "scaling", 96 / 72)
+            root = Path(directory)
+            app = Workbench(root / "workspace", root / "settings.json")
+            cleanup.callback(app.close_app)
+            app.minsize(1, 1)
+            app.store.set_library(app.snapshot["revision"], samples)
+            report = app.store.import_folder(app.store.data["revision"], samples)
+            app.reload()
+            for width, height in ((1080, 640), (1360, 820)):
+                with self.subTest(width=width, height=height):
+                    app.geometry(f"{width}x{height}+0+0")
+                    app.import_done(report)
+                    app.update()
+                    self.assertEqual((app.winfo_width(), app.winfo_height()), (width, height))
+                    self.assertEqual(tuple(button.cget("text") for button in app.details.control.buttons),
+                                     ("字段核对", "原票预览", "提取文本"))
+                    for widget in (app.stats_frame, *app.metric_buttons.values(), app.selection_button,
+                                   app.intake_button,
+                                   app.history_button, *app.filter_control.buttons, app.search_entry,
+                                   app.clear_search_button, app.detail_status, app.detail_close,
+                                   app.review_button, app.import_result_link):
+                        self.assert_inside(widget, app)
+                        self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth(), str(widget))
+                    self.assertEqual(app.search_entry.winfo_height(), app.clear_search_button.winfo_height())
+                    self.assertEqual(app.search_entry.winfo_rootx() + app.search_entry.winfo_width(),
+                                     app.clear_search_button.winfo_rootx())
+                    self.assert_inside(app.tree, app)
+                    self.assert_first_row_visible(app.tree)
+
+                    app.intake_button.invoke()
+                    dialog = app.import_dialog
+                    app.update()
+                    for widget in (*dialog.pages.control.buttons, dialog.choose_directory, dialog.choose_files,
+                                   dialog.recent_directory, dialog.scan_button, dialog.archive_target,
+                                   dialog.change_target, dialog.confirm, dialog.cancel):
+                        self.assert_inside(widget, dialog)
+                    dialog.pages.control.buttons[0].invoke()
+                    app.update()
+                    for widget in (dialog.change_settings, dialog.mail_status, dialog.folder_choice,
+                                   *dialog.presets.buttons, *dialog.date_entries):
+                        self.assert_inside(widget, dialog)
+                    dialog.cancel.invoke()
+
+                    app.import_result_link.invoke()
+                    history = next(window for window in app.winfo_children() if isinstance(window, ImportHistory))
+                    app.update()
+                    self.assertEqual(history.batch_tree.selection(), (report["id"],))
+                    for widget in (*history.filters.buttons, history.search_entry, history.batch_tree, history.tree,
+                                   history.open_mail_button, history.locate_button):
+                        self.assert_inside(widget, history)
+                    self.assert_first_row_visible(history.batch_tree)
+                    self.assert_first_row_visible(history.tree)
+                    history.destroy()
+                    app.dismiss_import_result()
+                    self.assertFalse(app.import_banner.grid_info())
 
     def test_1366x768_limits_keep_core_controls_visible(self):
         enable_dpi_awareness()
@@ -639,10 +1022,47 @@ class DpiLayoutTests(unittest.TestCase):
                             app.update()
                             self.assert_inside(app.batch_tree, app)
                             self.assertGreater(app.batch_tree.winfo_height(), p(90))
-                            app.pages.select(2)
+                            app.open_settings(GENERAL_SETTINGS)
                             app.update()
+                            self.assertTrue(app.library_button.winfo_viewable())
                             self.assert_inside(app.library_button, app)
+                            app.open_settings(MAIL_SETTINGS)
+                            app.mail_advanced.set_expanded(True)
+                            app.update()
+                            for widget in (*app.settings_pages.control.buttons, app.mail_address_entry,
+                                           app.mail_provider_pill, app.mail_session_pill, app.mail_feedback,
+                                           app.mail_save_button, app.mail_clear_button):
+                                self.assertTrue(widget.winfo_viewable(), str(widget))
+                                self.assert_inside(widget, app)
+                                self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth(), str(widget))
+                            app.open_settings(SYSTEM_SETTINGS)
+                            app.update()
+                            self.assertTrue(app.reset_button.winfo_viewable())
+                            self.assertFalse(app.library_button.winfo_viewable())
                             self.assert_inside(app.reset_button, app)
+
+                            credential = MailCredentialDialog(app, "name@163.com", "网易 163 邮箱")
+                            app.update()
+                            for widget in (credential.entry, credential.visibility,
+                                           dialog_button(credential.actions, "连接邮箱")):
+                                self.assert_inside(widget, credential)
+                            credential.destroy()
+
+                            app.open_import(MAIL_MODE)
+                            scope = app.import_dialog
+                            app.update()
+                            for widget in (*scope.presets.buttons, scope.confirm, scope.cancel):
+                                self.assert_inside(widget, scope)
+                            self.assertAlmostEqual(scope.winfo_rootx() + scope.winfo_width() / 2,
+                                                   app.winfo_rootx() + app.winfo_width() / 2, delta=p(16))
+                            scope.destroy()
+
+                            history = ImportHistory(app, app.store.import_history())
+                            app.update()
+                            for widget in (*history.filters.buttons, history.tree, history.open_mail_button):
+                                self.assert_inside(widget, history)
+                            self.assertGreaterEqual(history.tree.winfo_height(), p(90))
+                            history.destroy()
                         finally:
                             app.dirty = False
                             app.close_app()

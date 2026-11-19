@@ -8,7 +8,7 @@ from .domain import UserError, money, yuan
 from .labels import selectable
 from .store import uid
 from .theme import COLORS, FONT, MONO, fit_window, wrap_label
-from .widgets import hover_rows, table_scrollers
+from .widgets import StatusPill, hover_rows, table_scrollers
 
 if TYPE_CHECKING:
     from .gui import Workbench
@@ -51,22 +51,22 @@ class SelectionDialog(tk.Toplevel):
 
         dashboard = ttk.Frame(panel, style="Surface.TFrame", padding=(medium, small))
         dashboard.pack(fill="x", pady=(0, small))
+        dashboard.columnconfigure(0, minsize=p(172) + extra_large)
         dashboard.columnconfigure(1, weight=1)
         target_panel = ttk.Frame(dashboard, style="Surface.TFrame")
-        target_panel.grid(row=0, column=0, sticky="w", padx=(0, extra_large))
+        target_panel.grid(row=0, column=0, sticky="ew", padx=(0, extra_large))
         target_label = ttk.Label(target_panel, text="目标金额 / 元", style="SurfaceMuted.TLabel")
         target_label.pack(anchor="w", pady=(0, tiny))
-        self.target_entry = ttk.Entry(target_panel, textvariable=self.target, width=13,
+        self.target_entry = ttk.Entry(target_panel, textvariable=self.target, width=1,
                                       font=(MONO, 22), style="Amount.TEntry", justify="right")
-        self.target_entry.pack(fill="x")
+        self.target_entry.pack(fill="x", expand=True)
         progress_panel = ttk.Frame(dashboard, style="Surface.TFrame")
         progress_panel.grid(row=0, column=1, sticky="ew")
         badges = ttk.Frame(progress_panel, style="Surface.TFrame")
         badges.pack(fill="x")
-        self.source_badge = tk.Label(badges, textvariable=self.source_text, bg=COLORS.occupied_bg,
-                                     fg=COLORS.secondary, font=(FONT, 9), padx=small, pady=tiny)
+        self.source_badge = StatusPill(badges, textvariable=self.source_text)
         self.source_badge.pack(side="left")
-        self.difference_badge = tk.Label(badges, textvariable=self.difference_text, font=(FONT, 9), padx=small, pady=tiny)
+        self.difference_badge = StatusPill(badges, textvariable=self.difference_text)
         self.difference_badge.pack(side="left", padx=(tiny, 0))
         self.progress_label = ttk.Label(progress_panel, textvariable=self.progress_text, style="SurfaceMuted.TLabel")
         self.progress_label.pack(fill="x", pady=(tiny, 0))
@@ -90,20 +90,23 @@ class SelectionDialog(tk.Toplevel):
         self.confirm.pack(side="right")
         self.calculate_button = ttk.Button(self.action_row, text="计算最小超额组合", command=self.calculate, style="Primary.TButton")
         self.calculate_button.pack(side="right", padx=small)
-        ttk.Label(self.action_row, text="实际申报额 / 元", style="Muted.TLabel").pack(side="left")
-        self.declared_entry = ttk.Entry(self.action_row, textvariable=self.declared, width=12, font=(MONO, 10), justify="right")
-        self.declared_entry.pack(side="left", padx=(small, 0))
+        declared_field = ttk.Frame(self.action_row)
+        declared_field.pack(side="left", fill="x")
+        declared_field.columnconfigure(1, minsize=p(110))
+        ttk.Label(declared_field, text="实际申报额 / 元", style="Muted.TLabel").grid(row=0, column=0, padx=(0, small))
+        self.declared_entry = ttk.Entry(declared_field, textvariable=self.declared, width=1, font=(MONO, 10), justify="right")
+        self.declared_entry.grid(row=0, column=1, sticky="ew")
 
         tools = ttk.Frame(panel)
         tools.pack(fill="x", pady=(0, tiny))
         tools.columnconfigure(1, weight=1)
-        self.reset_button = ttk.Button(tools, text="重置全部约束为自动", style="Quiet.TButton", command=self.reset_constraints)
+        self.reset_button = ttk.Button(tools, text="重置约束", style="Quiet.TButton", command=self.reset_constraints)
         self.reset_button.grid(row=0, column=2, sticky="e")
         ttk.Label(tools, text=f"可用发票 {len(self.candidates)} 张", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         company = owner.snapshot["company"]
         ttk.Label(tools, text=f"报销公司  {company['name'] or company['tax_id']}", style="Muted.TLabel", width=1).grid(
             row=0, column=1, sticky="ew", padx=(small, small))
-        self.interaction_hint = ttk.Label(tools, text="点击复选框微调 · 点击约束列切换 · 右键指定",
+        self.interaction_hint = ttk.Label(tools, text="勾选发票调整组合。点击约束列切换，或右键选择约束。",
                                           style="Hint.TLabel", width=1)
         self.interaction_hint.grid(row=1, column=0, columnspan=3, sticky="ew")
         wrap_label(self.interaction_hint)
@@ -137,15 +140,15 @@ class SelectionDialog(tk.Toplevel):
             panel.configure(padding=(large, tiny) if compact else (extra_large, medium))
             dashboard.configure(padding=(small, tiny) if compact else (medium, small))
             dashboard.pack_configure(pady=(0, tiny if compact else small))
-            target_panel.grid_configure(padx=(0, small if compact else extra_large))
+            target_gap = small if compact else extra_large
+            dashboard.columnconfigure(0, minsize=p(172) + target_gap)
+            target_panel.grid_configure(padx=(0, target_gap))
             target_label.pack_configure(side="left" if compact else "top", padx=(0, small if compact else 0),
                                         pady=(0, 0 if compact else tiny))
             self.target_entry.configure(style="TEntry" if compact else "Amount.TEntry",
                                         font=(MONO, 12 if compact else 22))
             self.target_entry.pack_configure(side="left" if compact else "top")
             bottom.pack_configure(pady=(tiny if compact else small, 0))
-            self.source_badge.configure(pady=0 if compact else tiny)
-            self.difference_badge.configure(pady=0 if compact else tiny)
             self.progress_label.pack_configure(pady=(0 if compact else tiny, 0))
             self.progress_canvas.configure(height=small if compact else medium)
             self.interaction_hint.grid_configure(row=0 if compact else 1, column=1 if compact else 0,
@@ -312,8 +315,8 @@ class SelectionDialog(tk.Toplevel):
         self.fill()
         self.update_summary()
         self.calculate_button.configure(state="disabled", text="正在计算组合…")
-        self.show_notice("正在计算，可修改目标金额；条件变更后需重新计算。")
-        self.owner.task("正在计算精确选票组合…", lambda: self.store.recommend(target, forced, excluded),
+        self.show_notice("条件变更后需重新计算。")
+        self.owner.task("正在计算选票组合…", lambda: self.store.recommend(target, forced, excluded),
                         lambda result: self.calculated(result, version))
         self.watch_id = self.after(100, self.watch_task)
 
@@ -324,7 +327,7 @@ class SelectionDialog(tk.Toplevel):
         elif self.check_workspace():
             self.calculate_button.configure(state="normal", text="计算最小超额组合")
             if self.result is None:
-                self.show_notice("条件已变更或计算未完成，请重新计算组合。")
+                self.show_notice("请重新计算选票组合。")
 
     def calculated(self, result, version=None):
         if not self.winfo_exists() or not self.check_workspace():
@@ -388,7 +391,7 @@ class SelectionDialog(tk.Toplevel):
         tone = "success" if target is not None and total >= target else "warning"
         difference = total - target if target is not None else 0
         self.difference_text.set((f"超额 +¥{yuan(difference)}" if difference > 0 else "恰好达到目标" if difference == 0 else f"缺口 -¥{yuan(-difference)}") if target is not None else "请输入有效目标金额")
-        self.difference_badge.configure(bg=getattr(COLORS, tone + "_bg"), fg=getattr(COLORS, tone))
+        self.difference_badge.set_tone(tone)
         optimal = self.result is not None and self.result.get("optimal")
         if self.result is None:
             source = "等待计算"
@@ -397,17 +400,16 @@ class SelectionDialog(tk.Toplevel):
         else:
             source = "算法最优解" if optimal else "未生成方案"
         self.source_text.set(source)
-        self.source_badge.configure(bg=COLORS.success_bg if optimal else COLORS.occupied_bg,
-                                    fg=COLORS.success if optimal else COLORS.secondary)
+        self.source_badge.set_tone("success" if optimal else "occupied")
         valid = self.valid_selection()
         self.confirm.configure(state="normal" if valid else "disabled", style="Primary.TButton" if valid else "TButton")
         self.calculate_button.configure(style="TButton" if valid else "Primary.TButton")
         self.summary.set(f"选中 {len(self.selected_ids)} 张 · 票面 ¥{yuan(total)} · {self.difference_text.get()} · 可用 ¥{yuan(available)}")
         if self.result is not None:
             if target is not None and available < target:
-                self.show_notice(f"当前可用发票不足以凑齐目标额度，还缺 ¥{yuan(target - available)}。请调整目标或导入可用发票。")
+                self.show_notice(f"当前可用发票不足以凑齐目标额度，还缺 ¥{yuan(target - available)}。请调整目标或导入发票。")
             elif not valid:
-                self.show_notice("当前选择未满足目标金额、必选 / 排除约束或申报金额要求，请调整或重新计算。")
+                self.show_notice("请检查目标金额、申报金额和选票约束。")
             else:
                 self.show_notice("")
         self.draw_progress()
@@ -416,11 +418,13 @@ class SelectionDialog(tk.Toplevel):
         if self.owner.busy or not self.check_workspace():
             return
         if not self.valid_selection():
-            self.show_notice("当前方案尚不可确认，请核对条件并重新计算组合。")
+            self.show_notice("请核对选票条件并重新计算。")
             return
         ids, target, declared = self.selected_ids[:], self.target.get(), self.declared.get()
         total = self.selected_total()
-        if not messagebox.askyesno("确认整票占用", f"本次选中 {len(ids)} 张，票面合计 ¥{yuan(total)}。\n实际申报：{declared} 元。\n\n确认后整张票归属本批次，超额不结转。可在发票详情中修改状态；已退回或可用会释放该票。", parent=self):
+        prompt = (f"选中 {len(ids)} 张，票面合计 ¥{yuan(total)}。\n申报金额 ¥{declared}。\n\n"
+                  "确认后整张发票归属本批次，超额不结转。")
+        if not messagebox.askyesno("确认整票占用", prompt, parent=self):
             return
         revision, request_id, store, owner = self.revision, self.request_id, self.owner.store, self.owner
         self.destroy()
@@ -429,7 +433,7 @@ class SelectionDialog(tk.Toplevel):
             owner.pages.select(1)
             owner.batch_tree.selection_set(batch_id)
             owner.show_batch()
-            owner.status_text.set("批次已确认，所选发票已整票占用。可导出材料，并在发票详情中更新状态。")
+            owner.status_text.set("批次已确认，可导出报销材料。")
 
         owner.task("确认报销批次…", lambda: store.create_batch(revision, ids, target, declared, request_id), done)
 

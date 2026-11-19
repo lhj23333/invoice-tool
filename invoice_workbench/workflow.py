@@ -6,9 +6,9 @@ from .domain import UserError
 from .extract import SUPPORTED, file_format
 from .filesystem import is_directory_link
 from .mail import collect
-from .store import fingerprint
+from .store import ARCHIVE_DIRECTORIES, INTAKE_EXCLUDED_DIRECTORIES, fingerprint
 
-MANAGED = {"objects", "history", "exports", "backups", ".git", ".venv", "node_modules", "__pycache__"}
+MANAGED = ARCHIVE_DIRECTORIES | INTAKE_EXCLUDED_DIRECTORIES
 
 
 def contains_invoices(directory):
@@ -19,11 +19,10 @@ def contains_invoices(directory):
     return False
 
 
-def import_directory(store, revision, source, progress=None):
+def import_directory(store, revision, source, progress=None, *, scan_workspace=False):
     source = Path(source).expanduser().resolve()
-    if source == store.root or source in store.root.parents or any(
-            source.is_relative_to(store.root / d) for d in MANAGED):
-        raise UserError("请选择存放原始发票的文件夹，不要选择资料库或其内部目录。")
+    if source == store.root and not (scan_workspace and source == store.workspace):
+        raise UserError("请使用「扫描当前工作区新增文件」导入工作区中的发票。")
     if progress:
         progress("正在读取发票并生成记录…")
     return store.import_folder(revision, str(source), recursive=True, progress=progress)
@@ -35,6 +34,15 @@ def import_mailbox(store, revision, mailbox, folder, source, bounds, blocked, pr
         return store.import_mail(revision, source, scanned, rows, progress)
 
 
+def _check_duplicate_path(store, source, path):
+    if path.is_symlink() or path.resolve() != path or not path.is_relative_to(source):
+        raise UserError("重复文件路径已变化，已停止删除。")
+    if any(is_directory_link(parent) for parent in path.parents if parent.is_relative_to(source)):
+        raise UserError("重复文件目录已变为链接，已停止删除。")
+    if store._is_intake_excluded(path.parent):
+        raise UserError("重复文件位于程序管理的目录，已停止删除。")
+
+
 def remove_duplicate_files(store, revision, report):
     source = Path(report["source"])
     with store.mutex:
@@ -43,45 +51,45 @@ def remove_duplicate_files(store, revision, report):
             raise UserError("资料已更新，请重新导入后整理重复文件。")
         if source.resolve() != source or is_directory_link(source):
             raise UserError("导入目录路径已变化，已停止删除。")
-        removals = []
+        removals = {}
         for duplicate in report["duplicate_files"]:
             keep, remove = Path(duplicate["keep"]), Path(duplicate["remove"])
             for path in (keep, remove):
-                if path.is_symlink() or not path.resolve().is_relative_to(source) or path.resolve().is_relative_to(store.root):
-                    raise UserError("重复文件路径已变化或位于工作区，已停止删除。")
-                if any(is_directory_link(parent) for parent in path.parents if parent.is_relative_to(source)):
-                    raise UserError("重复文件目录已变为链接，已停止删除。")
+                _check_duplicate_path(store, source, path)
                 if fingerprint(path.read_bytes()) != duplicate["hash"]:
                     raise UserError(f"文件已变化，已停止删除：{path}")
             matching = [f for item in store.data["invoices"] for f in item["files"] if f["hash"] == duplicate["hash"]]
             if not matching:
-                raise UserError("重复文件尚未存入工作区，已停止删除。")
+                raise UserError("工作区缺少对应原件，已停止删除。")
             for file in matching:
                 if file_format(keep) != file_format(store.original(file)):
                     raise UserError("保留文件的扩展名与可核验原件不一致，已停止删除。")
-            if keep.resolve() == remove.resolve():
-                raise UserError("重复文件与保留文件路径相同，已停止删除。")
-            removals.append((keep, remove, duplicate["hash"]))
-        if {p.resolve() for _, p, _ in removals} & {p.resolve() for p, _, _ in removals}:
+            replacement = (keep, duplicate["hash"])
+            if removals.setdefault(remove, replacement) != replacement:
+                raise UserError("同一重复文件对应多个保留文件，已停止删除。")
+        if removals.keys() & {keep for keep, _ in removals.values()}:
             raise UserError("保留文件被列入删除范围，已停止删除。")
-        if store.library:
-            replacements = {remove: (keep.relative_to(store.library).as_posix(), digest) for keep, remove, digest in removals}
-            references = []
-            for file, _ in store._file_references():
-                if file.get("storage") != "library":
-                    continue
-                replacement = replacements.get(store._original_path(file))
-                if replacement and replacement[1] == file["hash"]:
-                    if file_format(replacement[0]) != file_format(file["path"]):
-                        raise UserError("保留文件的扩展名与历史原件不一致，已停止删除。")
-                    references.append((file, replacement[0]))
-            if references:
-                # 先让索引和历史报销批次指向保留原件，再删除副本。
-                with store.change(revision):
-                    for file, relative in references:
-                        file["path"] = relative
-        for keep, remove, digest in removals:
+        if not removals:
+            return 0
+        references = []
+        for file, _ in store._file_references():
+            remove = store._original_path(file)
+            if remove not in removals:
+                continue
+            keep, digest = removals[remove]
+            if (file.get("storage") != "library" or not keep.is_relative_to(store.library)
+                    or digest != file["hash"] or file_format(keep) != file_format(file["path"])):
+                raise UserError(f"文件仍被工作区引用，无法更新原件路径，已停止删除：{remove}")
+            references.append((file, keep.relative_to(store.library).as_posix()))
+        if references:
+            # 先保存全部原件引用，再删除副本。
+            with store.change(revision):
+                for file, relative in references:
+                    file["path"] = relative
+        for remove, (keep, digest) in removals.items():
             store._check()
+            _check_duplicate_path(store, source, keep)
+            _check_duplicate_path(store, source, remove)
             if fingerprint(keep.read_bytes()) != digest or fingerprint(remove.read_bytes()) != digest:
                 raise UserError("重复文件在整理期间发生变化，已停止删除。")
             remove.unlink()
