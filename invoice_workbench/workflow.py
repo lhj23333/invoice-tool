@@ -1,9 +1,11 @@
 from pathlib import Path
 import os
+from tempfile import TemporaryDirectory
 
 from .domain import UserError
-from .extract import SUPPORTED
+from .extract import SUPPORTED, file_format
 from .filesystem import is_directory_link
+from .mail import collect
 from .store import fingerprint
 
 MANAGED = {"objects", "history", "exports", "backups", ".git", ".venv", "node_modules", "__pycache__"}
@@ -24,7 +26,13 @@ def import_directory(store, revision, source, progress=None):
         raise UserError("请选择存放原始发票的文件夹，不要选择资料库或其内部目录。")
     if progress:
         progress("正在读取发票并生成记录…")
-    return store.import_folder(revision, str(source), recursive=True)
+    return store.import_folder(revision, str(source), recursive=True, progress=progress)
+
+
+def import_mailbox(store, revision, mailbox, folder, source, bounds, blocked, progress=None):
+    with TemporaryDirectory(prefix="invoice-mail-") as directory:
+        scanned, rows = collect(mailbox, folder, bounds, blocked, Path(directory), progress)
+        return store.import_mail(revision, source, scanned, rows, progress)
 
 
 def remove_duplicate_files(store, revision, report):
@@ -49,12 +57,29 @@ def remove_duplicate_files(store, revision, report):
             if not matching:
                 raise UserError("重复文件尚未存入工作区，已停止删除。")
             for file in matching:
-                store.original(file)
+                if file_format(keep) != file_format(store.original(file)):
+                    raise UserError("保留文件的扩展名与可核验原件不一致，已停止删除。")
             if keep.resolve() == remove.resolve():
                 raise UserError("重复文件与保留文件路径相同，已停止删除。")
             removals.append((keep, remove, duplicate["hash"]))
         if {p.resolve() for _, p, _ in removals} & {p.resolve() for p, _, _ in removals}:
             raise UserError("保留文件被列入删除范围，已停止删除。")
+        if store.library:
+            replacements = {remove: (keep.relative_to(store.library).as_posix(), digest) for keep, remove, digest in removals}
+            references = []
+            for file, _ in store._file_references():
+                if file.get("storage") != "library":
+                    continue
+                replacement = replacements.get(store._original_path(file))
+                if replacement and replacement[1] == file["hash"]:
+                    if file_format(replacement[0]) != file_format(file["path"]):
+                        raise UserError("保留文件的扩展名与历史原件不一致，已停止删除。")
+                    references.append((file, replacement[0]))
+            if references:
+                # 先让索引和历史报销批次指向保留原件，再删除副本。
+                with store.change(revision):
+                    for file, relative in references:
+                        file["path"] = relative
         for keep, remove, digest in removals:
             store._check()
             if fingerprint(keep.read_bytes()) != digest or fingerprint(remove.read_bytes()) != digest:

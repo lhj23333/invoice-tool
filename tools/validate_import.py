@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+from time import perf_counter
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,7 +100,9 @@ def validate(source):
             local_root = Path(directory)
             store = Store(local_root / "workspace")
             try:
+                started = perf_counter()
                 first = import_directory(store, store.data["revision"], source)
+                import_seconds = round(perf_counter() - started, 2)
                 assert not first["errors"], first["errors"]
                 records = store.view()["invoices"]
                 assert records, "没有导入发票"
@@ -118,7 +121,7 @@ def validate(source):
                 assert len(reopened.view()["invoices"]) == len(records), "重新打开后记录数量不匹配"
             finally:
                 reopened.close()
-            result = {"source_files": len(before), "invoice_records": len(records),
+            result = {"source_files": len(before), "invoice_records": len(records), "import_seconds": import_seconds,
                       "automatically_verified": sum(i["verification"]["passed"] for i in records),
                       "verification_issues": sum(not i["verification"]["passed"] for i in records),
                       "source_duplicate_candidates": len(first["duplicate_files"]),

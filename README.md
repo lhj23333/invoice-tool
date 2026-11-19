@@ -1,85 +1,67 @@
-# Invoice Workbench - Windows 发票管理工具
+# Invoice Workbench
 
-![Python](https://img.shields.io/badge/Python-%3E%3D3.11-blue.svg)![Platform](https://img.shields.io/badge/Platform-Windows-green.svg)![GUI](https://img.shields.io/badge/GUI-Tkinter-orange.svg)
+Windows 发票工作台。集中管理发票原件，自动核验票面信息，按目标金额选票并导出报销材料。
 
-**Invoice Workbench** 是基于 **Python + Tkinter** 的本地发票管理工具，支持发票导入、自动核验、重复文件整理、组合选票和报销批次导出。
+## 特性
 
----
+- 支持扫描本地资料库和通过 IMAP 按需收票。可导入 PDF、XML、PNG、JPG、OFD，以及 EML 中的发票附件。
+- 在本机识别图片、扫描 PDF 和 OFD。同票原件自动归并，核验异常可在导入记录中查看。
+- 发现内容相同的源文件时列出待整理的副本，确认后才删除。
+- 按目标金额组合选票，支持必选、排除和手动调整。批次导出为包含发票原件和一份 CSV 明细的 ZIP。
 
-## ✨ 特性
+## 快速开始
 
-- **📥 文件导入**：支持 PDF、XML、图片、OFD 及 EML 邮件附件。
-- **🔍 自动核验**：自动比较原件提取结果与记录中的金额、票号、日期、抬头和税号；字段不完整或冲突时停止选用。
-- **📂 重复整理**：导入后列出源目录中内容完全相同的发票副本，确认后删除重复副本并至少保留一份；选择“否”继续保留文件。
-- **🧮 组合选票**：按目标金额匹配发票，支持必选、排除和手动调整。
-- **📦 批次管理**：整票占用，导出平铺的发票文件与一份 CSV 明细。
-- **💾 本地管理**：工作区保存原件副本，可通过网盘在多台电脑间轮流使用；源文件仅在确认整理重复副本时删除。
-
----
-
-## ⚡ 快速开始
-
-### 安装与启动
-
-需要 **Windows Python 3.11 及以上的 Python 3（含 Tcl/Tk 和 pip）**。固定依赖中的 Pillow 13 要求 Python >= 3.11；
+便携版解压后运行 `InvoiceWorkbench.exe`。从源码运行需要 Windows x64 和 Python 3.11 或以上版本，Python 须包含 Tcl/Tk 和 pip。首次安装需要网络。
 
 ```powershell
-# 安装依赖
 .\setup.ps1
-
-# 启动程序
 .\start.ps1
 ```
 
-需要指定解释器时，可使用 `-Python` 传入可执行文件路径或命令名：
+1. 在「设置 → 发票资料库」选择存放原件的文件夹。也可以在首次本地导入时选择。
+2. 在「发票资料 → 导入发票」扫描资料库或从邮箱收票，在「导入记录」查看结果。
+3. 在「设置 → 报销公司」填写购买方抬头或税号。核验通过且匹配公司的发票可按额度选用。
+4. 在「报销批次」导出材料，在发票详情更新单张发票的报销状态。
+
+## 配置
+
+### 邮箱收票
+
+1. 在邮箱网页端启用 IMAP，在「设置 → IMAP 收票」填写并保存邮箱地址。常见 Outlook、QQ 和网易邮箱可自动匹配服务器，其他邮箱填写服务商提供的 SSL/TLS 地址和端口。
+2. 点击「导入发票 → 从邮箱收票」。Outlook 在浏览器授权，其他邮箱使用客户端授权码或应用专用密码。连接后选择文件夹和日期。
+3. 可在「IMAP 收票」设置禁止下载的域名。登录凭证仅在本次运行期间保留。
+
+从源码连接 Outlook 时，可在设置中填写 Microsoft Entra 应用的客户端 ID。注册时选择「移动和桌面应用程序」，使用 `http://localhost` 回调地址，并授予 Exchange Online 委托 IMAP 权限。连接个人邮箱时，应用注册须支持个人 Microsoft 帐户。便携版由发布者提供客户端 ID。[Microsoft 的应用注册说明](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app) · [IMAP OAuth 说明](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)
+
+### 本地数据
+
+资料库用于保存和扫描发票原件。应用目录下的 `data/` 默认保存设置、发票索引和历史记录。在「设置 → 系统数据库」恢复初始化会清空索引、报销批次、导入历史和设置，保留资料库路径、原件和已导出的文件。
+
+## 仓库结构
+
+- [invoice_workbench/](invoice_workbench/) 保存应用源码。
+- [tools/](tools/) 提供验证和便携包构建工具。
+- [tests/](tests/) 和 [samples/](samples/) 分别保存自动化测试和样例。
+- [app.py](app.py) 是程序入口，[setup.ps1](setup.ps1) 和 [start.ps1](start.ps1) 分别安装和启动应用。
+
+## 命令参考
 
 ```powershell
-# 指定 Python 安装路径
-.\setup.ps1 -Python "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe"
-
-# 检查环境
+# 检查启动环境
 .\start.ps1 -CheckEnvironment
-```
 
----
-
-## 📁 项目结构
-
-```text
-InvoiceWorkbench/
-├── invoice_workbench/       # 应用源码
-│   ├── gui.py              # 主窗口与发票管理
-│   ├── selection.py        # 组合选票窗口
-│   ├── domain.py           # 校验与选票算法
-│   ├── extract.py          # 票面信息提取
-│   ├── store.py            # 数据存储与批次导出
-│   ├── session.py          # 会话与写入锁
-│   ├── workflow.py         # 文件导入流程
-│   └── labels.py           # 共用界面标签
-├── tools/                  # 打包和开发辅助工具
-├── tests/                  # 自动化测试
-├── samples/                # 合成发票样例
-├── app.py                  # 程序入口
-├── requirements.txt        # 固定版本依赖
-├── setup.ps1               # 环境安装
-└── start.ps1               # 启动脚本
-```
-
----
-
-## 🛠️ 测试与构建
-
-```powershell
-# 运行测试
+# 运行自动化测试
 .\.venv\Scripts\python.exe -m unittest discover -v
 
-# 只读复测指定目录，临时副本和验证工作区自动清理
-.\.venv\Scripts\python.exe tools\validate_import.py --source "<本次验证的发票目录>"
+# 验证指定目录的导入与导出流程，保留源文件
+.\.venv\Scripts\python.exe tools\validate_import.py --source "<发票目录>"
 
-# 构建 Windows 便携包
-.\.venv\Scripts\python.exe tools\build_portable.py
+# 完成源码安装后构建便携包，输出到 dist/
+.\.venv\Scripts\python.exe tools\build_portable.py --outlook-client-id "<应用程序客户端 ID>"
 ```
 
-构建输出位于 `dist/`。已有便携运行时的开发目录也可使用 `.\runtime\python.exe` 执行上述命令。
+## 故障排查
 
----
+- 无法启动时运行 `.\start.ps1 -CheckEnvironment`，并查看应用目录中的 `startup-error.log`。安装或启动脚本可通过 `-Python` 指定解释器。
+- 提示数据库被外部修改或存在遗留会话时，核对同步状态，关闭其他正在使用该数据库的窗口，再点击「重新连接」。
+- 邮件附件或直链导入失败时，在「导入记录」查看原因，按邮件主题查找原件。

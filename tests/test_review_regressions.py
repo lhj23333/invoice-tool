@@ -2,12 +2,15 @@ from copy import deepcopy
 from email.message import EmailMessage
 import io
 import json
+from pathlib import Path
+import shutil
 import unittest
 import uuid
 import zipfile
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from pypdfium2 import PdfDocument
 
 from invoice_workbench.domain import UserError
 from invoice_workbench.extract import extract, from_text
@@ -51,6 +54,28 @@ def unsupported_encryption_pdf():
 
 
 class UsedInvoiceTests(StoreFixture, unittest.TestCase):
+    def test_reimbursed_unconfirmed_ocr_owns_its_manually_entered_invoice_number(self):
+        sample = Path(__file__).resolve().parents[1] / "samples" / "image-preview" / "manual-review.png"
+        shutil.copyfile(sample, self.input / sample.name)
+        self.store.import_folder(self.rev(), str(self.input))
+        item, = self.store.view()["invoices"]
+        self.assertTrue(item["ocr_unconfirmed"])
+        invoice_id = item["id"]
+        self.store.review(self.rev(), invoice_id, {
+            "number": "26000000000000000001", "date": "2026-10-01", "amount": "600.00",
+            "buyer_name": BUYER, "buyer_tax_id": TAX,
+        })
+        self.assertFalse(self.store.invoice(invoice_id)["verification"]["passed"])
+        self.store.set_invoice_status(self.rev(), invoice_id, "reimbursed")
+        write_invoice(self.input)
+        report = self.store.import_folder(self.rev(), str(self.input))
+        self.assertEqual((report["imported"], report["merged"]), (0, 1))
+        item, = self.store.view()["invoices"]
+        self.assertEqual((item["id"], item["reimbursement_status"]), (invoice_id, "reimbursed"))
+        self.assertEqual(self.store.recommend("500")["available_cents"], 0)
+        with self.assertRaises(UserError):
+            self.store.create_batch(self.rev(), [invoice_id], "500", "500", uuid.uuid4().hex)
+
     def test_same_invoice_format_merges_into_archived_used_record(self):
         item = self.import_one()
         self.store.set_invoice_status(self.rev(), item["id"], "reimbursed")
@@ -132,6 +157,27 @@ class VerificationInputTests(StoreFixture, unittest.TestCase):
         item = self.store.data["invoices"][0]
         self.assertTrue(item["verification"]["passed"], item["verification"]["issues"])
         self.assertEqual(self.store.recommend("500")["ids"], [item["id"]])
+
+    def test_pdf_ocr_checks_scan_with_a_text_footer_even_after_a_complete_invoice_page(self):
+        vector = pdf_document([invoice_text("26000000000000000002")])
+        scanned = io.BytesIO()
+        with PdfDocument(vector) as document:
+            page = document[0]
+            bitmap = page.render(scale=3)
+            bitmap.to_pil().convert("RGB").save(scanned, format="PDF", resolution=216)
+            bitmap.close()
+            page.close()
+        first = PdfReader(io.BytesIO(pdf_document([invoice_text("26000000000000000001")])))
+        writer = PdfWriter()
+        writer.add_page(first.pages[0])
+        second = writer.add_page(PdfReader(scanned).pages[0])
+        footer = PdfReader(io.BytesIO(pdf_document(["Scanned invoice footer"]))).pages[0]
+        second.merge_translated_page(footer, 0, -730)
+        self.assertEqual(second.extract_text().strip(), "Scanned invoice footer")
+        output = io.BytesIO()
+        writer.write(output)
+        parsed = extract(output.getvalue(), ".pdf")
+        self.assertTrue(parsed.get("multiple_invoice_identifiers"), parsed["raw_text"])
 
     def test_multiple_numbers_on_one_page_and_legacy_codes_are_rejected(self):
         for pages in ([invoice_text("26000000000000000001") + "\n" + invoice_text("26000000000000000002")],

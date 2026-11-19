@@ -1,12 +1,15 @@
 # Invoice Workbench
 
-- Build a native Windows desktop GUI. The current stage is local file organization; Outlook and OCR are deferred.
-- Run on demand. Do not add a continuously running collection service or require a server for core tasks.
-- Whole invoices belong to one active batch. Excess above the declared amount is never carried forward.
-- The user clarified on 2026-11-17 that backups were a development-only precaution, not a product feature. Do not add automatic backup, backup dialogs, or backup folders to the normal import flow.
-- 业务验证必须通过参数使用用户在当前任务中明确提供的源目录，禁止在代码或指令中固定某台设备的发票路径。验证前后比较源文件哈希，验证期间不得重命名、移动、删除或覆盖业务源文件。
-- Use synthetic fixtures under `samples` and `.test-tmp` during development. Never discover or scan real invoice locations without the user providing them.
-- Keep all index/objects/history data together for sequential cloud-drive synchronization. Detect changes and stop rather than overwriting externally modified state.
-- Run `python -m unittest discover -v` after substantive changes. Use the bundled portable runtime if the host runtime's Tcl installation cannot be read by Tcl.
-- Keep dependencies pinned. Preserve dependency license files when building a portable distribution.
-- Keep the left sidebar as the only main navigation (发票资料 / 报销批次 / 设置), with three independent page frames and no top-level tab strip. Scope stats/actions to their own page; use the native window close button. Source folders are for import; a workspace holds the index and stored originals.
+## 产品规则
+
+- 使用 Windows 原生 Tkinter 桌面界面。左侧导航为「发票资料」「报销批次」「设置」，各页只显示相关统计和操作，使用原生窗口关闭按钮。
+- 支持本地文件、本机 OCR 和按需 IMAP 收票。本地操作独立运行，发票邮件和附件只在用户发起收票时读取或下载。
+- IMAP 使用 TLS，以只读方式收取邮件。Outlook 使用 Microsoft 浏览器 OAuth，发布时提供客户端 ID，登录凭证只保留在运行内存中。下载默认使用公网 HTTPS，每次跳转均检查用户的域名黑名单。
+- 选票前必须通过原件自动核验。同票原件自动归并，核验异常写入导入记录。整张发票只归属一个有效批次，超出申报金额的部分不结转。
+- 系统数据库保存设置、索引和历史，用户选择的发票资料库保存原件。检测到索引被外部修改时停止写入。恢复初始化保留资料库路径和原件。备份仅用于开发验证。
+
+## 验证与构建
+
+- 开发验证使用 `samples/` 和 `.test-tmp/` 中的测试样例。业务验证只通过参数使用用户在当前任务中提供的源目录，比较验证前后的文件哈希，保持源文件路径和内容完整。
+- 代码变更后运行 `python -m unittest discover -v`。系统 Python 无法读取 Tcl/Tk 时，使用便携版 Python 运行。
+- 固定依赖版本，构建便携包时保留依赖许可证。
