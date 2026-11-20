@@ -80,7 +80,8 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 class OutlookOAuth:
     def __init__(self, address, application_id):
         if not application_id:
-            raise UserError("请在「设置 → IMAP 收票」填写并保存 Outlook OAuth Client ID。请使用 Microsoft Entra 应用注册的「应用程序（客户端）ID」。")
+            raise UserError("请在「设置 → 邮箱收票 → 高级服务器设置」填写 Outlook OAuth 客户端 ID。"
+                            "客户端 ID 可在 Microsoft Entra 的应用注册中找到。")
         self.address = address
         self.application_id = validate_client_id(application_id)
         self.account = None
@@ -127,7 +128,7 @@ class OutlookOAuth:
                 raise UserError("Outlook 登录已失效，请重新选择「从邮箱收票」完成授权。")
             result = self._authorize(scopes, cancelled)
         except TimeoutError:
-            raise UserError("等待 Microsoft 授权结果超时。请查看浏览器提示，核对应用注册的 http://localhost 重定向 URI 后重试。") from None
+            raise UserError("Microsoft 授权超时。请检查浏览器提示和 http://localhost 回调地址。") from None
         except RequestException:
             raise UserError("无法连接 Microsoft 登录服务，请检查网络后重试。") from None
         except OSError:

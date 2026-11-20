@@ -2,6 +2,8 @@ from .domain import eligible_invoice
 
 
 INVOICE_STATUS = {"available": "可用", "reserved": "已选入批次", "submitted": "已提交", "reimbursed": "已报销", "returned": "已退回"}
+SETTINGS_HINT = "管理工作区、报销公司和邮箱。"
+INVOICE_IMPORT_GUIDE = "从本地导入或从邮箱收票。"
 
 
 def selectable(item):

@@ -3,12 +3,12 @@ from email.message import EmailMessage
 from pathlib import Path
 import tempfile
 from threading import Event
-from tkinter import ttk
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from invoice_workbench.gui import Workbench
+from invoice_workbench.gui import GENERAL_SETTINGS, MAIL_SETTINGS, Workbench
+from invoice_workbench.import_dialogs import MAIL_MODE
 from invoice_workbench.selection import SelectionDialog
 from .helpers import BUYER, TAX, write_invoice, xml_invoice
 
@@ -51,25 +51,105 @@ class GuiTests(unittest.TestCase):
         client_id = str(uuid4())
         settings_file = self.app.settings_file
         workspace = self.app.store.root
-        self.app.pages.select(2)
+        self.app.deiconify()
+        self.app.open_settings(MAIL_SETTINGS)
         self.app.mail_address.set("name@outlook.com")
+        self.app.update()
         save_button = next(button for button in self.app.actions if button.cget("text") == "保存收票设置")
-        entry = next(widget for widget in save_button.master.master.winfo_children()
-                     if isinstance(widget, ttk.Entry) and widget.cget("textvariable") == str(self.app.mail_client_id))
+        entry = self.app.mail_client_entry
+        self.assertIs(entry.master.master, self.app.mail_advanced.content)
+        self.assertFalse(self.app.mail_advanced.expanded)
+        self.assertFalse(entry.winfo_viewable())
+        self.app.mail_advanced.header.invoke()
+        self.app.update_idletasks()
+        self.assertTrue(self.app.mail_advanced.expanded)
+        self.assertTrue(entry.winfo_viewable())
         entry.insert(0, f" {client_id.upper()} ")
+        self.app.mail_advanced.header.invoke()
+        self.app.update_idletasks()
+        self.assertFalse(entry.winfo_viewable())
         save_button.invoke()
         self.assertEqual(json.loads(settings_file.read_text(encoding="utf-8"))["mail_client_id"], client_id)
         self.assertNotIn(client_id, (workspace / "invoices.json").read_text(encoding="utf-8"))
+        self.assertEqual(self.app.mail_feedback.cget("style"), "success.SettingsFeedback.TLabel")
 
         self.app.close_app()
         self.app = Workbench(workspace, settings_file)
         self.app.withdraw()
-        self.app.pages.select(2)
+        self.app.open_settings(MAIL_SETTINGS)
         self.assertEqual(self.app.mail_client_id.get(), client_id)
         self.app.mail_client_id.set("")
         save_button = next(button for button in self.app.actions if button.cget("text") == "保存收票设置")
         save_button.invoke()
         self.assertEqual(json.loads(settings_file.read_text(encoding="utf-8"))["mail_client_id"], "")
+
+    def test_mail_settings_route_and_keep_invalid_input_until_corrected(self):
+        directory = self.root / "library"
+        directory.mkdir()
+        self.app.store.set_library(self.app.snapshot["revision"], directory)
+        self.app.reload()
+        self.app.deiconify()
+        self.app.open_import(MAIL_MODE)
+        dialog = self.app.import_dialog
+        self.assertTrue(dialog.confirm.instate(["disabled"]))
+        dialog.change_settings.invoke()
+        tabs = self.app.settings_pages
+        self.assertEqual(self.app.pages.current_index, 2)
+        self.assertEqual(tabs.variable.get(), MAIL_SETTINGS)
+        self.assertIsNone(self.app.import_dialog)
+        self.assertTrue(self.app.mail_clear_button.instate(["disabled"]))
+
+        self.app.mail_address_entry.insert(0, "name@outlook.com")
+        self.assertIn("Outlook · OAuth2 登录", self.app.mail_provider_pill.cget("text"))
+        self.assertIn("未保存", self.app.mail_feedback.cget("text"))
+        self.app.mail_advanced.header.invoke()
+        self.app.mail_port.set("0")
+        settings_before = self.app.settings_file.read_bytes()
+        save_button = next(button for button in self.app.actions if button.cget("text") == "保存收票设置")
+        save_button.invoke()
+        self.assertEqual(self.app.mail_feedback.cget("style"), "error.SettingsFeedback.TLabel")
+        self.assertEqual(self.app.settings_file.read_bytes(), settings_before)
+
+        tabs.control.buttons[0].invoke()
+        self.assertEqual(tabs.variable.get(), GENERAL_SETTINGS)
+        self.assertFalse(tabs.frames[1].grid_info())
+        tabs.control.buttons[1].invoke()
+        self.assertTrue(tabs.frames[1].grid_info())
+        self.assertTrue(self.app.mail_advanced.expanded)
+        self.assertEqual(self.app.mail_port.get(), "0")
+        self.app.mail_port.set("993")
+        save_button.invoke()
+        self.assertEqual(self.app.mail_feedback.cget("style"), "success.SettingsFeedback.TLabel")
+        self.assertEqual(json.loads(self.app.settings_file.read_text(encoding="utf-8"))["mail_port"], 993)
+
+    def test_provider_detection_opens_advanced_for_custom_server_and_preserves_draft(self):
+        app = self.app
+        app.deiconify()
+        app.open_settings(MAIL_SETTINGS)
+        app.mail_address_entry.insert(0, "name@QQ.COM")
+        app.update()
+        self.assertIn("QQ 邮箱 · 默认 imap.qq.com:993", app.mail_provider_pill.cget("text"))
+        self.assertFalse(app.mail_advanced.expanded)
+        self.assertFalse(app.mail_client_entry.winfo_viewable())
+
+        app.mail_address.set("name@example.com")
+        app.update_idletasks()
+        self.assertIn("其他邮箱", app.mail_provider_pill.cget("text"))
+        self.assertTrue(app.mail_advanced.expanded)
+        self.assertTrue(app.mail_client_entry.winfo_viewable())
+        app.mail_host.set("imap.example.com")
+        app.mail_port.set("1993")
+        self.assertIn("imap.example.com:1993", app.mail_provider_pill.cget("text"))
+        app.mail_advanced.header.invoke()
+        app.mail_address_entry.event_generate("<FocusOut>")
+        self.assertFalse(app.mail_advanced.expanded)
+
+        app.mail_address.set("name@163.com")
+        app.update_idletasks()
+        self.assertIn("网易 163 邮箱", app.mail_provider_pill.cget("text"))
+        self.assertFalse(app.mail_advanced.expanded)
+        self.assertFalse(app.mail_client_entry.winfo_viewable())
+        self.assertEqual((app.mail_host.get(), app.mail_port.get()), ("imap.example.com", "1993"))
 
     def test_cancel_mail_connection_releases_window_before_worker_returns(self):
         cancelled, release, completed = Event(), Event(), Event()
@@ -80,11 +160,13 @@ class GuiTests(unittest.TestCase):
 
         self.app.task("正在连接 Outlook IMAP", connect, cancelled=cancelled)
         try:
+            self.assertIn("正在连接", self.app.mail_session_pill.cget("text"))
             self.app.cancel_task_button.invoke()
             self.assertTrue(cancelled.is_set())
             self.assertFalse(self.app.busy)
             self.assertFalse(completed.is_set())
             self.assertEqual(self.app.cancel_task_button.winfo_manager(), "")
+            self.assertEqual(self.app.mail_session_pill.cget("text"), "未连接")
         finally:
             release.set()
             self.assertTrue(completed.wait(2))

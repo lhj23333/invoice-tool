@@ -140,23 +140,94 @@ class ImportWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.app.tree.get_children()), 1)
         self.assertIn("已有 1", self.app.status_text.get())
 
-    def test_choose_library_keeps_database_and_sets_the_local_import_directory(self):
+    def test_change_workspace_copies_legacy_index_and_archived_original(self):
         source = self.root / "source"
-        write_invoice(source)
-        workspace = self.app.store.root
-        with patch("invoice_workbench.gui.filedialog.askdirectory", return_value=str(source)):
-            self.app.choose_library()
-            self.wait_import()
-        self.assertEqual(self.app.store.root, workspace)
-        self.assertEqual(self.app.store.library, source)
-        self.assertEqual(len(self.app.tree.get_children()), 0)
-        self.app.import_directory()
+        original = write_invoice(source)
+        payload = original.read_bytes()
+        previous = self.app.store
+        previous.set_library(self.app.snapshot["revision"], source)
+        previous.import_folder(previous.data["revision"], source)
+        index_before = previous.state_path.read_bytes()
+        self.app.reload()
+        destination = self.root / "archive"
+        destination.mkdir()
+        self.app.change_workspace(destination)
         self.wait_import()
+        self.assertEqual(self.app.store.workspace, destination)
+        self.assertEqual(self.app.directory_text.get(), str(destination))
         self.assertEqual(len(self.app.tree.get_children()), 1)
-        file, = self.app.selected_item()["files"]
-        self.assertEqual(self.app.store.original(file), source / "invoice.xml")
+        item, = self.app.snapshot["invoices"]
+        file, = item["files"]
+        archived = self.app.store.original(file)
+        self.assertTrue(archived.is_relative_to(destination))
+        self.assertTrue(self.app.store.state_path.is_relative_to(destination))
+        self.assertEqual(archived.read_bytes(), payload)
+        self.assertEqual(original.read_bytes(), payload)
+        self.assertEqual(previous.state_path.read_bytes(), index_before)
         self.assertFalse((source / "invoices.json").exists())
-        self.assertFalse((source / ".invoice-session.json").exists())
+        config = self.app.settings_file
+        self.app.close_app()
+        self.app = Workbench(settings_file=config)
+        self.app.withdraw()
+        self.assertEqual(self.app.store.workspace, destination)
+        self.assertEqual(self.app.store.original(file), archived)
+
+    def test_import_dialog_separates_external_folder_and_file_sources_from_archive(self):
+        source = self.root / "external"
+        first = write_invoice(source, "first.xml")
+        second = write_invoice(source, "second.xml", number="26000000000000000002")
+        third = write_invoice(source, "third.xml", number="26000000000000000003")
+        originals = {p: p.read_bytes() for p in (first, second, third)}
+        archive = self.app.store.workspace
+        self.app.deiconify()
+        self.app.intake_button.invoke()
+        dialog = self.app.import_dialog
+        self.assertTrue(dialog.confirm.instate(["disabled"]))
+        self.assertIn(str(archive), dialog.archive_target.cget("text"))
+        dialog._set_files((str(first), str(third)))
+        dialog.confirm.invoke()
+        self.wait_import()
+        self.assertEqual(len(self.app.snapshot["invoices"]), 2)
+        self.assertEqual(self.app.last_import_report["kind"], "files")
+        self.assertEqual(self.app.settings["last_import_directory"], str(source))
+        self.app.intake_button.invoke()
+        dialog = self.app.import_dialog
+        dialog.recent_directory.invoke()
+        self.assertEqual(dialog.directory.get(), str(source))
+        dialog.confirm.invoke()
+        self.wait_import()
+        self.assertEqual(len(self.app.snapshot["invoices"]), 3)
+        self.assertEqual(self.app.last_import_report["imported"], 1)
+        for item in self.app.snapshot["invoices"]:
+            file, = item["files"]
+            self.assertTrue(self.app.store.original(file).is_relative_to(archive))
+        self.assertEqual({p: p.read_bytes() for p in originals}, originals)
+        self.assertEqual(self.app.store.workspace, archive)
+        self.app.intake_button.invoke()
+        dialog = self.app.import_dialog
+        dialog.change_target.invoke()
+        self.assertIsNone(self.app.import_dialog)
+        self.assertEqual(self.app.settings_pages.current_index, 0)
+
+    def test_scan_workspace_shortcut_omits_archived_objects(self):
+        workspace = self.app.store.workspace
+        invoice = write_invoice(workspace)
+        self.app.deiconify()
+        self.app.intake_button.invoke()
+        dialog = self.app.import_dialog
+        dialog.scan_button.invoke()
+        dialog.confirm.invoke()
+        self.wait_import()
+        self.assertEqual(self.app.last_import_report["scanned"], 1)
+        self.assertEqual(self.app.last_import_report["imported"], 1)
+        self.app.intake_button.invoke()
+        dialog = self.app.import_dialog
+        dialog.scan_button.invoke()
+        dialog.confirm.invoke()
+        self.wait_import()
+        self.assertEqual(self.app.last_import_report["scanned"], 1)
+        self.assertEqual(self.app.last_import_report["imported"], 0)
+        self.assertTrue(invoice.is_file())
 
     def test_legacy_source_setting_migrates_without_writing_to_source(self):
         source = self.root / "legacy-source"
@@ -194,10 +265,11 @@ class ImportWorkflowTests(unittest.TestCase):
         source = self.root / "source"
         write_invoice(source)
         (source / "bad.pdf").write_bytes(b"not a PDF")
-        with patch("invoice_workbench.gui.messagebox.showwarning") as warning:
-            self.app.start_import(source)
-            self.wait_import()
-            warning.assert_called_once()
+        self.app.start_import(source)
+        self.wait_import()
+        self.assertTrue(self.app.import_banner.grid_info())
+        self.assertIn("本次新增 1 张", self.app.import_result.cget("text"))
+        self.assertIn("1 条异常", self.app.import_result.cget("text"))
         self.assertEqual(len(self.app.tree.get_children()), 1)
         self.assertIn("失败 1", self.app.status_text.get())
 

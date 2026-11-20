@@ -294,6 +294,67 @@ class WorkspaceReconnectTests(unittest.TestCase):
         self.assertEqual(app.store.root, requested)
         self.assert_saved_workspace_unchanged()
 
+    def test_configured_workspace_waits_for_missing_index_to_sync(self):
+        workspace = self.root / "synced-workspace"
+        workspace.mkdir()
+        sample = ROOT / "samples" / "sample-01.xml"
+        with closing(Store(self.saved)) as store:
+            store.import_files(store.view()["revision"], [sample])
+            database = store.copy_workspace(store.view()["revision"], workspace)
+        index = database / "invoices.json"
+        pending = self.root / "pending-index.json"
+        original = index.read_bytes()
+        index.rename(pending)
+        self.settings_file.write_text(json.dumps({"data_directory": str(database)}), encoding="utf-8")
+        settings = self.settings_file.read_bytes()
+
+        app = self.open_app(None, blocked=True)
+        self.assertIsNone(app.store)
+        self.assertIn("缺少发票索引", app.status_text.get())
+        self.assertTrue(app.library_button.instate(["!disabled"]))
+        app.reconnect_library()
+        self.assertFalse(app.session_ok)
+        self.assertFalse(index.exists())
+        self.assertFalse((database / ".invoice-session.json").exists())
+        self.assertEqual(self.settings_file.read_bytes(), settings)
+
+        pending.rename(index)
+        app.reconnect_library()
+        self.assertTrue(app.session_ok)
+        self.assertEqual(app.store.root, database)
+        self.assertEqual(len(app.snapshot["invoices"]), 1)
+        self.assertEqual(index.read_bytes(), original)
+
+    def test_disconnected_workspace_can_switch_to_an_existing_index(self):
+        workspace = self.root / "other-workspace"
+        workspace.mkdir()
+        sample = ROOT / "samples" / "sample-01.xml"
+        with closing(Store(self.root / "other-legacy-database")) as store:
+            store.import_files(store.view()["revision"], [sample])
+            database = store.copy_workspace(store.view()["revision"], workspace)
+        app = self.open_app(self.saved)
+        disconnected = app.store
+        pending = self.root / "unavailable-index.json"
+        disconnected.state_path.rename(pending)
+        self.assertFalse(app.reload())
+        self.assertTrue(app.library_button.instate(["!disabled"]))
+
+        empty = self.root / "empty"
+        empty.mkdir()
+        self.answer_dialog(lambda: app.change_workspace(empty), "无法打开工作区", 1)
+        self.assertEqual(list(empty.iterdir()), [])
+        self.assertIs(app.store, disconnected)
+        self.assertEqual(app.connection_directory, disconnected.root)
+
+        app.change_workspace(workspace)
+        self.assertTrue(app.session_ok)
+        self.assertTrue(disconnected.closed)
+        self.assertEqual(app.store.root, database)
+        self.assertEqual(len(app.snapshot["invoices"]), 1)
+        self.assertEqual(json.loads(self.settings_file.read_text())["data_directory"], str(database))
+        self.assertEqual(pending.read_bytes(), self.saved_index)
+        self.assertFalse(disconnected.state_path.exists())
+
     def test_legacy_app_settings_open_and_recover_the_same_custom_workspace(self):
         application = self.root / "app"
         application.mkdir()

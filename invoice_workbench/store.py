@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+from tempfile import TemporaryDirectory
 import threading
 import uuid
 import zipfile
@@ -27,6 +28,14 @@ INVOICE_STATUSES = {"available", "reserved", "submitted", "reimbursed", "returne
 OCCUPIED_STATUSES = {"reserved", "submitted", "reimbursed"}
 SKIPPED_MAIL_OFD = "同一封邮件已有 PDF 发票文件，已跳过 OFD。"
 MAIL_ORIGINALS = ".invoice-mail"
+WORKSPACE_DATABASE = ".invoice-workbench"
+INVOICE_INDEX = "invoices.json"
+ARCHIVE_DIRECTORIES = {"objects", "history", "exports", "backups"}
+INTAKE_EXCLUDED_DIRECTORIES = {".git", ".venv", "node_modules", "__pycache__", MAIL_ORIGINALS, WORKSPACE_DATABASE}
+
+
+def _is_legacy_database(directory):
+    return (directory / INVOICE_INDEX).is_file() and (directory / "objects").is_dir()
 
 
 def now() -> str:
@@ -123,10 +132,14 @@ def _mail_file_suffix(row):
 class Store:
     """One active local writer; cloud drive synchronization remains sequential."""
 
-    def __init__(self, directory: str | Path, recover_lock: bool = False):
-        self.root = Path(directory).expanduser().resolve()
+    def __init__(self, directory: str | Path, recover_lock: bool = False, *, require_existing: bool = False):
+        directory = Path(directory).expanduser()
+        self.root = directory.resolve()
+        self.state_path = self.root / INVOICE_INDEX
+        require_existing = require_existing or WORKSPACE_DATABASE in {directory.name.lower(), self.root.name.lower()}
+        if require_existing and not self.state_path.is_file():
+            raise UserError(f"工作区缺少发票索引 {INVOICE_INDEX}。请确认目录可用且已同步，再点击「重新连接」。")
         self.root.mkdir(parents=True, exist_ok=True)
-        self.state_path = self.root / "invoices.json"
         self.lock_path = self.root / ".invoice-session.json"
         self.lock_id = uid()
         self.mutex = threading.RLock()
@@ -148,12 +161,12 @@ class Store:
         except Exception as exc:
             self.guard.close()
             if isinstance(exc, FileExistsError):
-                raise UserError("此资料库有未结束的会话。关闭其他电脑上的工具并等同步完成后，点击“重新连接”；异常退出可在该入口恢复会话。") from None
+                raise UserError("工作区有未结束的会话。请关闭其他设备上的工作区，等同步完成后点击「重新连接」。") from None
             raise
         try:
             for folder in ("objects", "history", "exports"):
                 (self.root / folder).mkdir(exist_ok=True)
-            if self.state_path.exists():
+            if require_existing or self.state_path.exists():
                 raw = self.state_path.read_bytes()
                 self.data = json.loads(raw)
                 if self.data.get("schema") not in {1, 2, 3, 4, 5} or not isinstance(self.data.get("invoices"), list) or not isinstance(self.data.get("batches"), list):
@@ -205,11 +218,11 @@ class Store:
         raw = self.state_path.read_bytes() if self.state_path.exists() else None
         current = fingerprint(raw) if raw is not None else None
         if current != self.expected:
-            raise UserError("检测到资料被外部修改或网盘同步覆盖。已停止写入，请退出并处理冲突副本后重新打开。")
+            raise UserError("发票索引已被外部修改，已停止写入。请核对索引后点击「重新连接」。")
         # Common sync conflict copies are not silently treated as a separate empty library.
-        conflicts = [p for p in self.root.glob("invoices*.json") if p.name != "invoices.json"]
+        conflicts = [p for p in self.root.glob("invoices*.json") if p.name != INVOICE_INDEX]
         if conflicts:
-            raise UserError("发现发票索引的其他副本，请先核对网盘冲突文件，避免覆盖使用状态。")
+            raise UserError("发现索引冲突副本。请处理冲突后点击「重新连接」。")
         try:
             lock = json.loads(self.lock_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -219,9 +232,9 @@ class Store:
                 self._write_marker()
                 lock = {"session": self.lock_id}
             except FileExistsError:
-                raise UserError("资料会话已变化，请点击“重新连接”核对状态。") from None
+                raise UserError("工作区会话已变化，请点击「重新连接」。") from None
         except (OSError, ValueError):
-            raise UserError("资料会话标记无法读取。请等同步完成后点击“重新连接”。") from None
+            raise UserError("无法读取工作区会话。请等同步完成后点击「重新连接」。") from None
         if not isinstance(lock, dict) or lock.get("session") != self.lock_id:
             raise UserError("另一会话已接管资料目录，本次已停止写入。请等同步完成后重新连接。")
         return raw
@@ -283,6 +296,46 @@ class Store:
     def library(self):
         directory = self.data.get("library_directory")
         return Path(directory) if directory else None
+
+    @property
+    def workspace(self):
+        if self.root.name == WORKSPACE_DATABASE:
+            return self.root.parent
+        return self.library or self.root
+
+    def copy_workspace(self, revision, workspace):
+        workspace = Path(workspace).resolve()
+        target = workspace / WORKSPACE_DATABASE
+        if not workspace.is_dir() or target.is_symlink() or (target.exists() and is_directory_link(target)):
+            raise UserError("请选择可访问的工作区目录。")
+        if target.exists():
+            raise UserError("所选目录已包含工作区数据，请重新打开已有工作区。")
+        with self.mutex:
+            self._check()
+            if revision != self.data["revision"]:
+                raise UserError("工作区已更新，请刷新后重试。")
+            with TemporaryDirectory(prefix=f"{WORKSPACE_DATABASE}-", dir=workspace) as directory:
+                staging = Path(directory) / "database"
+                clone = Store(staging)
+                try:
+                    with clone.change(clone.data["revision"], keep_history=False):
+                        clone.data = deepcopy(self.data)
+                        clone.data.pop("library_directory", None)
+                        originals = {}
+                        for (previous, _), (file, _) in zip(self._file_references(), clone._file_references(), strict=True):
+                            key = previous.get("storage"), previous["path"], previous["hash"]
+                            if key not in originals:
+                                original, payload = self._read_original(previous)
+                                relative = f"objects/{file['hash']}{original.suffix.lower()}"
+                                clone._ensure_original(clone._object_path(relative), payload, file["hash"])
+                                originals[key] = relative
+                            file["path"] = originals[key]
+                            file.pop("storage", None)
+                    self._check()
+                finally:
+                    clone.close()
+                staging.rename(target)
+        return target
 
     def occupied(self) -> dict:
         return {i["id"]: i["active_batch_id"] for i in self.data["invoices"]
@@ -721,41 +774,62 @@ class Store:
         source = Path(directory).expanduser().resolve()
         if not source.is_dir():
             raise UserError("导入目录不存在。")
-        if self.library and (not source.is_relative_to(self.library) or source.is_relative_to(self.library / MAIL_ORIGINALS)):
-            raise UserError("请选择当前发票资料库或其子文件夹。")
-        # 扫描时跳过数据库管理的目录，避免重复导入工具保存的文件。
-        managed = {self.root / p for p in ("objects", "exports", "history", "backups")}
-        skipped = {p for p in managed if not source.is_relative_to(p)}
-        result = self._import_report("directory", str(source))
-        source_hashes = {}
+        if self._is_intake_excluded(source):
+            raise UserError("所选目录由程序管理。请选择存放待导入发票的目录。")
         files = []
         if recursive:
             for base, dirs, names in os.walk(source, followlinks=False):
-                dirs[:] = [d for d in dirs if not is_directory_link(Path(base) / d)
-                           and d not in {".git", "node_modules", ".venv", "__pycache__", MAIL_ORIGINALS}
-                           and (Path(base) / d).resolve() not in skipped]
-                files.extend(Path(base) / n for n in names if Path(n).suffix.lower() in SUPPORTED | {".eml"})
+                base = Path(base)
+                dirs[:] = [d for d in dirs if not is_directory_link(base / d)
+                           and not self._is_intake_excluded(base / d)
+                           and not _is_legacy_database(base / d)]
+                files.extend(base / n for n in names if Path(n).suffix.lower() in SUPPORTED | {".eml"})
                 if len(files) > 500:
                     raise UserError("单次最多扫描 500 个文件，请缩小导入范围。")
         else:
             files = [p for p in source.iterdir() if p.suffix.lower() in SUPPORTED | {".eml"} and p.is_file()]
         if len(files) > 500:
             raise UserError("单次最多扫描 500 个文件，请缩小导入范围。")
-        result["scanned"] = len(files)
+        return self._import_local_files(revision, files, self._import_report("directory", str(source), len(files)),
+                                        progress, directory=source)
+
+    def _is_intake_excluded(self, directory):
+        if self.root.name.lower() == WORKSPACE_DATABASE and directory.is_relative_to(self.root):
+            return True
+        for folder in (directory, *directory.parents):
+            name = folder.name.lower()
+            if name in INTAKE_EXCLUDED_DIRECTORIES or name.startswith(f"{WORKSPACE_DATABASE}-"):
+                return True
+            if name in ARCHIVE_DIRECTORIES and (folder.parent == self.root or _is_legacy_database(folder.parent)):
+                return True
+        return False
+
+    def import_files(self, revision, paths, progress=None):
+        files = list(dict.fromkeys(Path(path).expanduser().absolute() for path in paths))
+        if not 1 <= len(files) <= 500:
+            raise UserError("请选择 1 至 500 个发票文件。")
+        report = self._import_report("files", f"选择的 {len(files)} 个文件", len(files))
+        report["source_directory"] = str(files[0].parent)
+        return self._import_local_files(revision, files, report, progress)
+
+    def _import_local_files(self, revision, files, result, progress, *, directory=None):
         if not files:
             return result
+        source_hashes = {}
         with self.change(revision):
             lookup = _ImportIndex(self.data["invoices"])
             for number, path in enumerate(sorted(files), 1):
                 if progress:
                     progress(f"正在核验本地文件 {number} / {len(files)}…")
-                row = {"file": str(path.relative_to(source))}
+                row = {"file": str(path.relative_to(directory) if directory else path)}
                 try:
                     resolved = path.resolve()
-                    if not resolved.is_relative_to(source) or path.is_symlink():
-                        raise UserError("跳过指向导入目录外的文件。")
-                    if any(resolved.is_relative_to(p) for p in skipped):
-                        continue
+                    if path.is_symlink() or (directory and not resolved.is_relative_to(directory)):
+                        raise UserError("跳过符号链接或导入目录外的文件。")
+                    if self._is_intake_excluded(resolved.parent):
+                        raise UserError("跳过工作区内部的归档文件。")
+                    if path.suffix.lower() not in SUPPORTED | {".eml"}:
+                        raise UserError("此文件格式不受支持。")
                     if path.stat().st_size > MAX_BYTES:
                         raise UserError("文件超过 20 MB。")
                     data = path.read_bytes()
@@ -768,8 +842,10 @@ class Store:
                             self._record_import_note(result, row, "本地 EML 未发现支持的附件。正文链接可从邮箱收票，或手动下载后导入。")
                     else:
                         digest = fingerprint(data)
-                        self._record_import(lookup, result, row, data, digest, str(path), path.name, resolved if self.library else None)
-                        source_hashes.setdefault(digest, []).append(path)
+                        local = resolved if self.library and resolved.is_relative_to(self.library) else None
+                        self._record_import(lookup, result, row, data, digest, str(path), path.name, local)
+                        if directory:
+                            source_hashes.setdefault(digest, []).append(path)
                 except (UserError, OSError) as exc:
                     self._record_import_error(result, row, exc)
             conflicts = self.duplicate_ids()
@@ -781,10 +857,15 @@ class Store:
                     paths = source_hashes.get(digest, ())
                     if len(paths) < 2:
                         continue
-                    keep = next((p for p in paths if file_format(p) == file_format(file["path"])), None)
-                    if keep is not None:
-                        result["duplicate_files"].extend({"keep": str(keep), "remove": str(path), "hash": digest}
-                                                         for path in paths if path != keep)
+                    candidates = [p for p in paths if file_format(p) == file_format(file["path"])]
+                    if not candidates:
+                        continue
+                    keep = candidates[0]
+                    if file.get("storage") == "library":
+                        # 引用只能更新为同一资料库内的路径。
+                        keep = next((p for p in candidates if p.is_relative_to(self.library)), keep)
+                    result["duplicate_files"].extend({"keep": str(keep), "remove": str(path), "hash": digest}
+                                                     for path in paths if path != keep)
             self._save_import_report(result)
         return result
 
@@ -937,10 +1018,10 @@ class Store:
     def _read_original(self, file):
         path = self._original_path(file)
         if not path.is_file():
-            raise UserError("原票尚未同步或路径无效，请等网盘完成文件下载。")
+            raise UserError("找不到发票原件。请检查文件位置和同步状态。")
         data = path.read_bytes()
         if fingerprint(data) != file["hash"]:
-            raise UserError("原票校验失败，文件可能被修改；请恢复原件后重试。")
+            raise UserError("原件校验失败。请恢复原件后重试。")
         return path, data
 
     def original(self, file: dict) -> Path:
