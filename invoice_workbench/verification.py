@@ -1,4 +1,4 @@
-from .domain import UserError, normalize_name, validate_invoice, yuan
+from .domain import UserError, comparable, validate_invoice, yuan
 from .extract import REQUIRED_FIELDS, extract
 from .recognition import EVIDENCE_VERSION
 
@@ -6,14 +6,6 @@ from .recognition import EVIDENCE_VERSION
 FIELDS = ("number", "code", "date", "amount_cents", "buyer_name", "buyer_tax_id", "seller_name")
 TITLES = {"number": "发票号码", "code": "发票代码", "date": "开票日期", "amount_cents": "价税合计",
           "buyer_name": "购买方抬头", "buyer_tax_id": "购买方税号", "seller_name": "销售方名称"}
-
-
-def comparable(field, value):
-    if field in {"buyer_name", "seller_name"}:
-        return normalize_name(value)
-    if field == "buyer_tax_id":
-        return "".join(value.split()).upper()
-    return value
 
 
 def original_evidence(file, read_original, *, refresh=False, cache=None):

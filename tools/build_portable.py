@@ -80,8 +80,9 @@ def build(destination, outlook_client_id=None):
                       else configured_client_id(ROOT))
     if not application_id:
         raise UserError(f"发布构建需要 Outlook OAuth 客户端 ID。请使用 --outlook-client-id、{CLIENT_ID_ENV} 或 {CLIENT_ID_FILE} 提供。")
-    files = ("app.py", "README.md", "requirements.txt", "AGENTS.md", "setup.ps1", "start.ps1", "Install-ToSoft.ps1")
-    directories = ("invoice_workbench", "samples", "tests", "tools")
+    # 只分发运行所需文件；面向开发者的 AGENTS.md 和 tests/ 不进便携包。
+    files = ("app.py", "README.md", "requirements.txt", "setup.ps1", "start.ps1", "Install-ToSoft.ps1")
+    directories = ("invoice_workbench", "samples", "tools")
     for name in files:
         if not (ROOT / name).is_file():
             raise FileNotFoundError(f"构建缺少必需文件：{ROOT / name}")

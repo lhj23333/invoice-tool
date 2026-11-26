@@ -317,7 +317,7 @@ class SelectionDialog(tk.Toplevel):
         self.calculate_button.configure(state="disabled", text="正在计算组合…")
         self.show_notice("条件变更后需重新计算。")
         self.owner.task("正在计算选票组合…", lambda: self.store.recommend(target, forced, excluded),
-                        lambda result: self.calculated(result, version))
+                        lambda result: self.calculated(result, version), reload_after=False)
         self.watch_id = self.after(100, self.watch_task)
 
     def watch_task(self):

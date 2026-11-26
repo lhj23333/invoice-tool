@@ -37,6 +37,9 @@ class PortableTests(unittest.TestCase):
             self.assertEqual(set(manifest), {p.relative_to(destination).as_posix()
                                             for p in destination.rglob("*")
                                             if p.is_file() and p.name != "bundle-manifest.json"})
+            # 便携包只分发运行所需文件，开发者文档和测试源码不进发布包。
+            self.assertNotIn("AGENTS.md", manifest)
+            self.assertFalse(any(name.startswith("tests/") for name in manifest))
             for name, digest in manifest.items():
                 self.assertEqual(hashlib.sha256((destination / name).read_bytes()).hexdigest(), digest, name)
             archives = list(Path(directory).glob("*.zip"))
@@ -57,10 +60,23 @@ class PortableTests(unittest.TestCase):
             self.assertEqual(Path(info["prefix"]), destination / "runtime")
             self.assertEqual(info["version"], list(sys.version_info[:2]))
 
+            # 便携包不再分发 tests/，这里直接验证 Tk + Pillow + pdfium 能渲染 PDF 预览。
             preview = subprocess.run([str(runtime), "-B", "-c",
+                                      "import tempfile; from pathlib import Path; "
                                       "from invoice_workbench.runtime import configure_bundled_tk; configure_bundled_tk(); "
-                                      "import unittest; unittest.main(module=None, "
-                                      "argv=['unittest', 'tests.test_gui.GuiTests.test_pdf_and_image_preview', '-v'])"],
+                                      "from invoice_workbench.gui import Workbench; "
+                                      "root = Path(tempfile.mkdtemp()); "
+                                      "app = Workbench(root / 'workspace', root / 'settings.json'); "
+                                      "app.withdraw(); app.update(); "
+                                      "store = app.store; store.import_folder(store.data['revision'], 'samples', recursive=True); "
+                                      "app.reload(); app.update(); "
+                                      "item = next(i for i in app.snapshot['invoices'] "
+                                      "if any(f['name'].endswith('.pdf') for f in i['files'])); "
+                                      "app.load_invoice(item); app.details.select(1); app.update(); "
+                                      "app.file_choice.current(next(n for n, f in enumerate(item['files']) "
+                                      "if f['name'].endswith('.pdf'))); "
+                                      "app.render_preview(); assert app.image_reference is not None; "
+                                      "app.dirty = False; app.close_app(); print('preview ok')"],
                                      cwd=destination, env=environment, capture_output=True, timeout=60)
             self.assertEqual(preview.returncode, 0, preview.stderr.decode(errors="replace"))
             subprocess.run([str(destination / "InvoiceWorkbench.exe"), "--help"],

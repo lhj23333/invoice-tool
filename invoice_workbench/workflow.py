@@ -1,11 +1,13 @@
 from pathlib import Path
+import json
 import os
 from tempfile import TemporaryDirectory
+from time import perf_counter
 
 from .domain import UserError
 from .extract import SUPPORTED, file_format
 from .filesystem import is_directory_link
-from .mail import collect
+from .mail import CollectionCancelled, MAIL_SCREENING_VERSION, collect
 from .store import ARCHIVE_DIRECTORIES, INTAKE_EXCLUDED_DIRECTORIES, fingerprint
 
 MANAGED = ARCHIVE_DIRECTORIES | INTAKE_EXCLUDED_DIRECTORIES
@@ -28,10 +30,22 @@ def import_directory(store, revision, source, progress=None, *, scan_workspace=F
     return store.import_folder(revision, str(source), recursive=True, progress=progress)
 
 
-def import_mailbox(store, revision, mailbox, folder, source, bounds, blocked, progress=None):
+def import_mailbox(store, revision, mailbox, folder, source, bounds, blocked, progress=None, *,
+                   deep_scan=False, force_rescan=False, cancelled=None):
+    started = perf_counter()
+    scope = json.dumps((*mailbox.profile, folder), ensure_ascii=False)
+    policy = fingerprint(json.dumps((MAIL_SCREENING_VERSION, sorted(blocked))).encode("utf-8"))
+    previous = {} if force_rescan else store.mail_checkpoint(scope, policy)
+    checkpoint = {"scope": scope, "policy": policy}
     with TemporaryDirectory(prefix="invoice-mail-") as directory:
-        scanned, rows = collect(mailbox, folder, bounds, blocked, Path(directory), progress)
-        return store.import_mail(revision, source, scanned, rows, progress)
+        stats, rows = collect(mailbox, folder, bounds, blocked, Path(directory), progress,
+                              deep_scan=deep_scan, previous=previous, checkpoint=checkpoint,
+                              cancelled=cancelled)
+        if cancelled is not None and cancelled.is_set():
+            raise CollectionCancelled()
+        stats["screen_seconds"] = round(perf_counter() - started, 2)
+        return store.import_mail(revision, source, stats.pop("scanned"), rows, progress,
+                                 screening=stats, checkpoint=checkpoint)
 
 
 def _check_duplicate_path(store, source, path):
