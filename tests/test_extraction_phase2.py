@@ -7,8 +7,9 @@ from unittest import mock
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from invoice_workbench.domain import UserError
-from invoice_workbench.extract import (AMOUNT_UNCONFIRMED_WARNING, _ofd_structured_values, extract, from_recognition,
-                                      from_text, inspect_mail_document)
+from invoice_workbench.extract import (AMOUNT_UNCONFIRMED_WARNING, MULTIPLE_INVOICE_IDENTIFIERS_WARNING,
+                                      _ofd_structured_values, extract, from_recognition, from_text,
+                                      inspect_mail_document)
 from invoice_workbench.labels import selectable
 from invoice_workbench.recognition import (AMOUNT_SCORE_FLOOR, EVIDENCE_VERSION, amount_cross_checked,
                                            chinese_amount, ofd_document)
@@ -78,6 +79,47 @@ class AmountCrossCheckTests(unittest.TestCase):
         self.assertEqual(parsed["amount_cents"], 55500)
         self.assertTrue(parsed["ocr_unconfirmed"])
         self.assertIn(AMOUNT_UNCONFIRMED_WARNING, parsed["warnings"])
+
+    def test_integer_and_one_decimal_low_amounts_respect_score_floor(self):
+        for amount in ("¥555", "¥555.0"):
+            with self.subTest(amount=amount):
+                raw = ("电子发票（增值税专用发票）\n"
+                       f"发票号码：{NUMBER} 开票日期：2025年11月11日\n"
+                       "购买方信息\n"
+                       f"名称：{BUYER}\n"
+                       "价税合计（大写）伍佰伍拾伍圆整\n"
+                       f"（小写）{amount}")
+                reliable = raw.replace(amount, "□□□")
+                parsed = from_recognition(ocr_pages(raw, reliable, [(0.10, f"（小写）{amount}")]), "图片本地识别")
+                self.assertEqual(parsed["amount_cents"], 55500)
+                self.assertTrue(parsed["ocr_unconfirmed"])
+                self.assertIn(AMOUNT_UNCONFIRMED_WARNING, parsed["warnings"])
+        self.assertTrue(amount_cross_checked("价税合计（大写）伍佰伍拾伍圆整", 55500,
+                                             [(0.95, "（小写）¥555")]))
+        self.assertFalse(amount_cross_checked("价税合计（大写）壹仟贰佰叁拾肆圆伍角", 123450,
+                                              [(0.10, "（小写）¥1,234.5")]))
+
+    def test_amount_cross_check_does_not_bridge_pages(self):
+        first = ("电子发票（增值税专用发票）\n"
+                 f"发票号码：{NUMBER} 开票日期：2025年11月11日\n"
+                 "购买方信息\n"
+                 f"名称：{BUYER}\n"
+                 "（小写）¥555.00")
+        second = "价税合计（大写）伍佰伍拾伍圆整"
+        cross = from_recognition([(first, first.replace("¥555.00", "□□□.□□"),
+                                   [(0.95, "（小写）¥555.00")]),
+                                  (second, second, ())], "PDF 本地识别")
+        self.assertEqual(cross["amount_cents"], 55500)
+        self.assertTrue(cross["ocr_unconfirmed"])
+        self.assertIn(AMOUNT_UNCONFIRMED_WARNING, cross["warnings"])
+
+        same = first.replace("（小写）¥555.00", "价税合计（大写）伍佰伍拾伍圆整（小写）¥555.00")
+        same_line = "价税合计（大写）伍佰伍拾伍圆整（小写）¥555.00"
+        confirmed = from_recognition([(same, same.replace("555.00", "□□□.□□"), [(0.95, same_line)]),
+                                      (second, second, ())], "PDF 本地识别")
+        self.assertEqual(confirmed["amount_cents"], 55500)
+        self.assertFalse(confirmed.get("ocr_unconfirmed"))
+        self.assertNotIn(AMOUNT_UNCONFIRMED_WARNING, confirmed["warnings"])
 
     def test_other_low_confidence_fields_still_block(self):
         raw = INVOICE_TEXT.replace(BUYER, "海南麒麟云服科技□限公司")
@@ -192,6 +234,16 @@ class OfdStructureTests(unittest.TestCase):
         self.assertEqual(parsed["buyer_tax_id"], "9150010807MGZHI002")
         self.assertEqual(parsed["seller_name"], "杭州融易算企业管理咨询有限公司")
         self.assertEqual(parsed["recognition_version"], EVIDENCE_VERSION)
+
+    def test_complete_metadata_still_rejects_multiple_numbers_in_page_text(self):
+        page = "".join([text_object("n1", 20, 10, "发票号码：24112000000048542163"),
+                        text_object("n2", 20, 20, "发票号码：24112000000048542164")])
+        with mock.patch("invoice_workbench.extract.recognize_ofd",
+                        side_effect=AssertionError("完整结构层不应渲染页面")):
+            parsed = extract(ofd_package(custom=FULL_CUSTOM, page=page), ".ofd")
+        self.assertEqual(parsed["method"], "OFD 结构提取")
+        self.assertTrue(parsed["multiple_invoice_identifiers"])
+        self.assertIn(MULTIPLE_INVOICE_IDENTIFIERS_WARNING, parsed["warnings"])
 
     def test_custom_tag_layer_labels_page_text_objects(self):
         custom = ('<ofd:CustomDatas>'

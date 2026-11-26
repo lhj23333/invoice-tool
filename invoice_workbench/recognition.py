@@ -120,6 +120,13 @@ def uppercase_amounts(text):
     return [value for value in values if value is not None]
 
 
+def _line_amount_cents(line):
+    """低分行中的金额候选（整数、一至两位小数、千分位），统一换算为分。"""
+    for token in re.findall(r"(?<![\d.,])\d[\d,]*(?:\.\d{1,2})?(?![\d.])", line):
+        whole, _, fraction = token.replace(",", "").partition(".")
+        yield int(whole or 0) * 100 + int((fraction + "00")[:2])
+
+
 def amount_cross_checked(text, cents, low_lines=()):
     """小写金额与同页大写金额精确一致、且行级置信度达标时才确认金额字段。
 
@@ -131,10 +138,10 @@ def amount_cross_checked(text, cents, low_lines=()):
     matches = list(CN_AMOUNT.finditer(compact))
     if not matches or any(chinese_amount(match.group(0)) != cents for match in matches):
         return False
-    needles = {f"{cents // 100}.{cents % 100:02d}", f"{cents // 100:,}.{cents % 100:02d}"}
     for score, line in low_lines:
         compact_line = re.sub(r"\s+", "", line)
-        if any(needle in compact_line for needle in needles) or any(match.group(0) in compact_line for match in matches):
+        # 不能只匹配固定的两位小数写法，否则 ¥555 或 ¥555.0 会绕过行级置信度下限。
+        if cents in _line_amount_cents(compact_line) or any(match.group(0) in compact_line for match in matches):
             if score < AMOUNT_SCORE_FLOOR:
                 return False
     return True

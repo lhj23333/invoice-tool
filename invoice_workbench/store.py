@@ -1251,7 +1251,10 @@ class Store:
                             attachment_row = {"file": f"{row['file']} / {attachment['name']}",
                                               "name": attachment["name"], "payload": attachment["payload"]}
                             if attachment["oversized"]:
-                                self._record_import_error(result, attachment_row, "文件超过 20 MB。")
+                                # payload 只用于核验；导入记录要写入索引 JSON，不能保留 bytes。
+                                metadata = {key: value for key, value in attachment_row.items()
+                                            if key not in {"name", "payload"}}
+                                self._record_import_error(result, metadata, "文件超过 20 MB。")
                             else:
                                 rows.append(attachment_row)
                         if rows:

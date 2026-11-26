@@ -131,6 +131,15 @@ def _apply_parties(result: dict, left: str, right: str) -> bool:
     return bool(name or tax)
 
 
+def invoice_identifiers(text):
+    """扫描文本中带标签的发票号码与代码，供文字层和 OFD 页面文本共用。"""
+    text = str(text).replace("\u3000", " ").replace("：", ":")
+    numbers = re.findall(r"(?:发\s*票\s*号\s*码|Invoice\s*(?:No\.?|Number))\s*:?\s*(\d{20}|\d{8})(?!\d)",
+                         text, re.I)
+    codes = re.findall(r"(?:发\s*票\s*代\s*码|Invoice\s*Code)\s*:?\s*(\d{10,12})(?!\d)", text, re.I)
+    return numbers, codes
+
+
 def from_text(text: str) -> dict:
     # 提取结果由自动核验流程与存储字段逐项比较。
     text = text.replace("\u3000", " ").replace("：", ":")
@@ -140,10 +149,7 @@ def from_text(text: str) -> dict:
         match = re.search(pattern, source, re.I)
         return match.group(1).strip() if match else ""
 
-    number_pattern = r"(?:发\s*票\s*号\s*码|Invoice\s*(?:No\.?|Number))\s*:?\s*(\d{20}|\d{8})(?!\d)"
-    code_pattern = r"(?:发\s*票\s*代\s*码|Invoice\s*Code)\s*:?\s*(\d{10,12})(?!\d)"
-    numbers = re.findall(number_pattern, text, re.I)
-    codes = re.findall(code_pattern, text, re.I)
+    numbers, codes = invoice_identifiers(text)
     result["number"] = numbers[0] if numbers else ""
     result["code"] = codes[0] if codes else ""
     check_invoice_identifiers(result, numbers, codes)
@@ -325,17 +331,25 @@ def from_xml(data: bytes) -> dict:
 
 
 def from_recognition(pages, method, warnings=()):
+    pages = list(pages)
     raw = "\n".join(page[0] for page in pages)
     reliable = "\n".join(page[1] for page in pages)
     # 低于 MIN_SCORE 的行保留原始文本与得分，供金额大小写交叉校验使用。
-    low_lines = [entry for page in pages for entry in (page[2] if len(page) > 2 else ())]
+    page_low_lines = [page[2] if len(page) > 2 else () for page in pages]
     result = from_text(reliable)
     observed = result.copy() if raw == reliable else from_text(raw)
     result.update(raw_text=raw[:RAW_TEXT_LIMIT], method=method, recognition_version=EVIDENCE_VERSION)
     result["warnings"].extend(warnings)
+
+    def same_page_confirmation(cents):
+        # 小写金额与中文大写必须同页互证；跨页出现的大写不能确认另一页的低分小写金额。
+        return any(from_text(page[0]).get("amount_cents") == cents
+                   and amount_cross_checked(page[0], cents, page_lows)
+                   for page, page_lows in zip(pages, page_low_lines))
+
     amount_confirmed = False
     if observed.get("amount_cents") and observed["amount_cents"] != result.get("amount_cents"):
-        if amount_cross_checked(raw, observed["amount_cents"], low_lines):
+        if same_page_confirmation(observed["amount_cents"]):
             # 小写金额与大写金额精确一致：该金额字段视为已确认，不再因行级得分 0.93-0.97 阻断。
             result["amount_cents"] = observed["amount_cents"]
             amount_confirmed = True
@@ -504,6 +518,13 @@ def _ofd_evidence(data, *, render):
     text = document["text"]
     layer_warnings = list(structured["warnings"])
     if has_required_fields(structured) and not layer_warnings:
+        # 结构层完整时仍扫描页面文字：元数据只记录一张票时，页面文本仍可能包含多张发票。
+        numbers, codes = invoice_identifiers(text or "")
+        if structured.get("number"):
+            numbers = [structured["number"], *numbers]
+        if structured.get("code"):
+            codes = [structured["code"], *codes]
+        check_invoice_identifiers(structured, numbers, codes)
         # 文字层保留发票标题等上下文，供邮件筛选与详情展示；字段仍以结构层为准。
         structured.update(raw_text=(text or structured.get("raw_text") or "")[:RAW_TEXT_LIMIT],
                           method="OFD 结构提取", recognition_version=EVIDENCE_VERSION)

@@ -77,6 +77,23 @@ class Round2FixTests(StoreFixture, unittest.TestCase):
         item, = self.store.view()["invoices"]
         self.assertEqual([file["name"] for file in item["files"]], ["invoice.pdf"])
 
+    def test_local_eml_oversized_attachment_keeps_import_record_serializable(self):
+        data = sample_eml("报销发票（附超大附件）", [
+            ("超大附件.pdf", b"%PDF-" + b"0" * (21 * 1024 * 1024), "attachment"),
+            ("invoice.pdf", (SAMPLES / "sample-01.pdf").read_bytes(), "attachment"),
+        ])
+        path = self.eml("invoice-with-oversized-attachment.eml", data)
+        self.assertLess(path.stat().st_size, 80 * 1024 * 1024)
+        report = self.store.import_folder(self.rev(), str(self.input))
+        self.assertEqual((report["imported"], len(report["errors"])), (1, 1))
+        self.assertIn("超大附件.pdf", report["errors"][0]["file"])
+        self.assertIn("文件超过 20 MB", report["errors"][0]["error"])
+        self.assertEqual([row["result"] for row in report["items"]], ["error", "imported"])
+        item, = self.store.view()["invoices"]
+        self.assertEqual([file["name"] for file in item["files"]], ["invoice.pdf"])
+        self.assertEqual(self.store.data["import_runs"][-1]["errors"], report["errors"],
+                         "导入记录连同超限附件错误必须成功写入索引")
+
     def test_local_eml_skips_marketing_inline_images(self):
         data = sample_eml("双十一云服务优惠，可开具发票", [
             ("logo.png", image_bytes(), "inline"),
