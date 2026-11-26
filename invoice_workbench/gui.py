@@ -6,14 +6,10 @@ import json
 import logging
 from pathlib import Path
 import queue
-import shutil
 from tempfile import NamedTemporaryFile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-
-from PIL import Image, ImageTk
-import pypdfium2 as pdfium
 
 from . import __version__
 from .domain import UserError, yuan
@@ -22,6 +18,7 @@ from .import_dialogs import ImportDialog, ImportHistory, LOCAL_MODE, MAIL_MODE, 
 from .labels import INVOICE_IMPORT_GUIDE, INVOICE_STATUS, SETTINGS_HINT, selectable, state_label
 from .mail import IMAPMailbox, domain_list, mailbox_profile
 from .outlook_auth import OUTLOOK_IMAP_HOST, OutlookOAuth, configured_client_id, validate_client_id
+from .preview import PreviewPane
 from .selection import SelectionDialog
 from .store import ARCHIVE_DIRECTORIES, INVOICE_INDEX, OCCUPIED_STATUSES, WORKSPACE_DATABASE, Store
 from .theme import COLORS, FONT, MONO, Theme, enable_dpi_awareness, fit_window, wrap_label
@@ -141,7 +138,8 @@ class DuplicateFilesDialog(tk.Toplevel):
 
 
 class Workbench(tk.Tk):
-    def __init__(self, data_dir: Path | None = None, settings_file: Path | None = None, *, recover_lock=False):
+    def __init__(self, data_dir: Path | None = None, settings_file: Path | None = None, *, recover_lock=False,
+                 preview_async=None):
         enable_dpi_awareness()
         super().__init__()
         self.store = None
@@ -165,19 +163,15 @@ class Workbench(tk.Tk):
         self.busy = False
         self.task_cancelled = None
         self.events = queue.Queue()
+        self.next_task_id = 0
+        self.active_task_id = None
         self.actions = []
         self.current_id = None
         self.dirty = False
         self.loading = False
         self.selecting_invoice = False
-        self.image_reference = None
-        self.preview_image = None
-        self.preview_key = None
-        self.preview_zoom = 1.0
-        self.preview_fit = True
-        self.preview_after = None
-        self.preview_generation = 0
-        self.preview_resize_position = None
+        self.preview = None
+        self.preview_async = preview_async
         self.import_dialog = None
         self.last_import_report = None
         self.protocol("WM_DELETE_WINDOW", self.close_app)
@@ -403,12 +397,9 @@ class Workbench(tk.Tk):
         table_scrollers(left, self.tree)
         hover_rows(self.tree)
         self.empty_card = ttk.Frame(self.tree, style="SettingsCard.TFrame", padding=(medium, small))
-        self.empty_hint = ttk.Label(self.empty_card, style="Section.TLabel", anchor="center")
-        self.empty_hint.pack(fill="x")
-        self.empty_actions = ttk.Frame(self.empty_card)
-        self.empty_actions.pack(pady=(small, 0))
-        self.empty_import = self.button(self.empty_actions, "导入发票", self.open_import, side="left")
-        self.empty_clear = ttk.Button(self.empty_actions, text="清除筛选", command=self.reset_invoice_filters)
+        ttk.Label(self.empty_card, text="没有匹配的发票", style="Section.TLabel", anchor="center").pack(fill="x")
+        self.empty_clear = ttk.Button(self.empty_card, text="清除筛选", command=self.reset_invoice_filters)
+        self.empty_clear.pack(pady=(small, 0))
         self.tree.bind("<<TreeviewSelect>>", self.select_invoice)
         self.tree.bind("<ButtonRelease-1>", lambda event: self.show_detail()
                        if self.current_id and self.tree.identify_row(event.y) == self.current_id else None)
@@ -490,6 +481,10 @@ class Workbench(tk.Tk):
         preview_area.pack(fill="both", expand=True)
         self.preview_canvas = tk.Canvas(preview_area, bg=COLORS.occupied_bg, highlightthickness=0, width=1, height=1)
         table_scrollers(preview_area, self.preview_canvas)
+        self.preview = PreviewPane(self, self.preview_canvas, theme=self.theme, zoom_text=self.zoom_text,
+                                   is_active=self._preview_active, current_file=self.selected_file,
+                                   resolver=self._preview_resolver)
+        self.preview.async_enabled = self.preview_async is True
         preview_area.bind("<Configure>", lambda event: self.schedule_preview(resizing=True))
         self.raw = tk.Text(text_page, wrap="word", bg=COLORS.surface, fg=COLORS.text, relief="flat", borderwidth=0,
                            font=(FONT, 10), state="disabled", width=1, height=1, padx=medium, pady=medium)
@@ -808,6 +803,8 @@ class Workbench(tk.Tk):
             new.close()
             raise
         old = self.store
+        # 先让旧工作区的预览请求作废，再替换并关闭资料会话。
+        self.cancel_preview_render()
         self.store = new
         self.connection_directory = new.root
         if old:
@@ -899,6 +896,7 @@ class Workbench(tk.Tk):
         self.workspace_status.set("◌ 正在处理" if self.busy else "● 数据库已连接" if self.session_ok else "○ 数据库未连接")
         self.workspace_label.configure(foreground=COLORS.secondary if self.session_ok else COLORS.warning)
         self.status_label.configure(foreground=COLORS.text if self.busy else COLORS.secondary if self.session_ok else COLORS.error)
+        self.cancel_task_button.configure(text="取消邮箱连接" if self.connecting_mail else "取消任务")
         self._update_mail_session()
         for control, visible in (
             (self.progress, self.busy),
@@ -924,6 +922,7 @@ class Workbench(tk.Tk):
             return
         directory = self.store.root if self.store else self.connection_directory
         self.connection_directory = directory
+        self.cancel_preview_render()
         if self.store:
             self.store.close()
             self.store = None
@@ -1020,8 +1019,13 @@ class Workbench(tk.Tk):
         selected = self.current_id
         self.tree.delete(*self.tree.get_children())
         for item in self.invoices_by_id.values():
-            if query and query not in " ".join(str(item.get(k, "")) for k in ("number", "buyer_name", "buyer_tax_id", "seller_name")).lower():
-                continue
+            if query:
+                documents = list(item.get("files", ())) + list(item.get("mail_xml", ()))
+                haystack = " ".join(str(item.get(k) or "") for k in
+                                    ("number", "buyer_name", "buyer_tax_id", "seller_name", "note"))
+                haystack += " " + " ".join(str(document.get("name") or "") for document in documents)
+                if query not in haystack.lower():
+                    continue
             occupied = item.get("reimbursement_status") in OCCUPIED_STATUSES
             available = selectable(item)
             pending = not item.get("archived") and not occupied and not available
@@ -1053,18 +1057,10 @@ class Workbench(tk.Tk):
                 self.update_review_banner()
         count, total = len(self.tree.get_children()), len(self.snapshot.get("invoices", []))
         self.list_summary.set(f"显示 {count} / {total} 张" if total else INVOICE_IMPORT_GUIDE)
-        if count:
-            self.empty_card.place_forget()
-        else:
-            filtered = bool(query or active_filter != "全部")
-            for button in (self.empty_import, self.empty_clear):
-                button.pack_forget()
-            self.empty_hint.configure(text="没有匹配的发票" if filtered else "暂无发票")
-            if filtered:
-                self.empty_clear.pack(side="left")
-            else:
-                self.empty_import.pack(side="left")
+        if total and not count:
             self.empty_card.place(relx=0.5, rely=0.55, anchor="center")
+        else:
+            self.empty_card.place_forget()
 
     def mark_dirty(self, *_):
         if not self.loading and self.current_id and not self.dirty:
@@ -1226,9 +1222,7 @@ class Workbench(tk.Tk):
     def hide_detail(self):
         if self.detail_visible:
             self.detail_visible = False
-            self.cancel_preview_render()
-            self.preview_resize_position = None
-            self.preview_canvas.delete("all")
+            self.preview.hide()
             self.splitter.forget(self.detail_pane)
 
     @staticmethod
@@ -1246,112 +1240,80 @@ class Workbench(tk.Tk):
         index = self.file_choice.current()
         return item["files"][index] if item and 0 <= index < len(item["files"]) else None
 
-    def clear_preview(self):
-        self.cancel_preview_render()
-        self.preview_image = self.preview_key = None
-        self.preview_zoom = 1.0
-        self.preview_fit = True
-        self.preview_resize_position = None
-        self.image_reference = None
-        self.preview_canvas.delete("all")
-        self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
-
-    def preview_scroll_position(self):
-        return self.preview_canvas.xview()[0], self.preview_canvas.yview()[0]
-
-    def cancel_preview_render(self):
-        self.preview_generation += 1
-        if self.preview_after is not None:
-            self.after_cancel(self.preview_after)
-            self.preview_after = None
-
-    def preview_is_active(self):
+    def _preview_active(self):
         return (self.detail_visible and self.current_id is not None and self.pages.current_index == 0
                 and self.details.current_index == 1)
 
+    def _preview_resolver(self):
+        """绑定当次请求的资料会话，工作线程不再读取可能已被替换的 self.store。"""
+        store = self.store
+
+        def resolve(file):
+            if store is None:
+                raise UserError("资料会话已关闭，请重新启动工具。")
+            return store.original(file)
+
+        return resolve
+
+    def clear_preview(self):
+        self.preview.clear()
+
+    def preview_scroll_position(self):
+        return self.preview.scroll_position()
+
+    def cancel_preview_render(self):
+        self.preview.cancel()
+
+    def preview_is_active(self):
+        return self.preview.active()
+
     def schedule_preview(self, *, resizing=False):
-        self.cancel_preview_render()
-        if self.preview_is_active():
-            # 在画布随外框改变尺寸之前记录位置，避免 Tk 按旧滚动范围提前限制位置。
-            if resizing and self.image_reference is not None and self.preview_resize_position is None:
-                self.preview_resize_position = self.preview_scroll_position()
-            generation = self.preview_generation
-            self.preview_after = self.after(100, lambda: self.render_preview() if generation == self.preview_generation else None)
+        self.preview.schedule(resizing=resizing)
 
     def preview_file_changed(self, event=None):
-        self.preview_zoom = 1.0
-        self.preview_fit = True
-        self.render_preview()
+        self.preview.file_changed()
 
     def zoom_preview(self, factor):
-        if factor is None:
-            self.preview_fit = True
-        self.preview_zoom = 1.0 if factor is None else max(0.25, min(3.0, self.preview_zoom * factor))
-        self.render_preview()
+        self.preview.zoom_by(factor)
 
     def reset_preview_zoom(self):
-        self.preview_fit = False
-        self.preview_zoom = 1.0
-        self.render_preview()
+        self.preview.reset_zoom()
 
     def render_preview(self):
-        self.cancel_preview_render()
-        if not self.preview_is_active():
-            return
-        file = self.selected_file()
-        x_position, y_position = self.preview_resize_position or self.preview_scroll_position()
-        self.preview_resize_position = None
-        self.image_reference = None
-        self.preview_canvas.delete("all")
-        self.zoom_text.set(f"{self.preview_zoom:.0%}")
-        if not file or not self.store:
-            self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
-            return
-        try:
-            path = self.store.original(file)
-            suffix = path.suffix.lower()
-            if self.preview_key != path:
-                x_position = y_position = 0.0
-                self.preview_image = None
-                if suffix == ".pdf":
-                    doc = pdfium.PdfDocument(str(path))
-                    try:
-                        page = doc[0]
-                        try:
-                            bitmap = page.render(scale=min(3, 1800 / max(page.get_size())))
-                            try:
-                                self.preview_image = bitmap.to_pil().copy()
-                            finally:
-                                bitmap.close()
-                        finally:
-                            page.close()
-                    finally:
-                        doc.close()
-                elif suffix in {".png", ".jpg", ".jpeg"}:
-                    with Image.open(path) as source:
-                        self.preview_image = source.copy()
-                self.preview_key = path
-            p = self.theme.px
-            if self.preview_image is None:
-                self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
-                self.preview_canvas.create_text(p(16), p(20), anchor="nw", text="此格式请使用“打开原件”查看。\n文字内容位于“提取文本”。", fill=COLORS.secondary,
-                                                font=(FONT, 10), width=max(p(100), self.preview_canvas.winfo_width() - p(32)))
-                return
-            base_width = max(p(100), self.preview_canvas.winfo_width() - p(32)) if self.preview_fit else self.preview_image.width
-            width = max(1, round(base_width * self.preview_zoom))
-            image = self.preview_image.resize((width, max(1, round(width * self.preview_image.height / self.preview_image.width))), Image.Resampling.LANCZOS)
-            self.image_reference = ImageTk.PhotoImage(image, master=self)
-            x = max(p(16), (self.preview_canvas.winfo_width() - width) // 2)
-            self.preview_canvas.create_rectangle(x + p(3), p(19), x + width + p(3), image.height + p(19), fill=COLORS.line, outline="")
-            self.preview_canvas.create_image(x, p(16), anchor="nw", image=self.image_reference)
-            self.preview_canvas.configure(scrollregion=(0, 0, max(self.preview_canvas.winfo_width(), width + p(32)), image.height + p(32)))
-            self.preview_canvas.xview_moveto(x_position)
-            self.preview_canvas.yview_moveto(y_position)
-        except Exception as exc:
-            self.preview_key = self.preview_image = None
-            self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
-            self.preview_canvas.create_text(self.theme.px(16), self.theme.px(20), anchor="nw", text=f"无法生成预览，请打开原件核对。\n{exc}", fill=COLORS.error, font=(FONT, 10),
-                                            width=max(100, self.preview_canvas.winfo_width() - self.theme.px(32)))
+        self.preview.render()
+
+    # 预览状态由 PreviewPane 持有，这里保留原有属性名供既有调用方和测试读取。
+    @property
+    def image_reference(self):
+        return self.preview.photo
+
+    @property
+    def preview_image(self):
+        return self.preview.image
+
+    @property
+    def preview_key(self):
+        return self.preview.key
+
+    @property
+    def preview_zoom(self):
+        return self.preview.zoom
+
+    @property
+    def preview_fit(self):
+        return self.preview.fit
+
+    @property
+    def preview_after(self):
+        return self.preview.after_id
+
+    @property
+    def preview_generation(self):
+        return self.preview.generation
+
+    @property
+    def preview_resize_position(self):
+        return self.preview.resize_position
 
     def open_original(self):
         file = self.selected_file()
@@ -1363,36 +1325,47 @@ class Workbench(tk.Tk):
             except (UserError, OSError) as exc:
                 messagebox.showerror("无法打开原件", str(exc), parent=self)
 
+    def _task_channel(self):
+        """分配递增的任务编号，返回只携带该编号的事件发送器。"""
+        self.next_task_id += 1
+        task_id = self.next_task_id
+        return task_id, lambda kind, payload: self.events.put((task_id, kind, payload))
+
     def task(self, description, work, done=None, *, preserve_edits=True, cancelled=None, connecting_mail=False,
-             failed=None):
+             failed=None, task_id=None, pill="处理中", reload_after=True):
         if self.busy:
             return
+        if task_id is None:
+            task_id = self._task_channel()[0]
         self.busy = True
+        self.active_task_id = task_id
         self.task_cancelled = cancelled
-        self.connecting_mail = connecting_mail or cancelled is not None
+        self.connecting_mail = connecting_mail
         self.preserve_edits = preserve_edits
+        self.reload_after = reload_after
         self.status_text.set(description)
-        self.task_pill.configure(text="连接邮箱" if self.connecting_mail else "处理中")
+        self.task_pill.configure(text="连接邮箱" if self.connecting_mail else pill)
         self.update_connection_status()
         self.update_actions()
         self.progress.start(12)
-        events = self.events
 
         def run():
             try:
                 result = work()
                 if cancelled is None or not cancelled.is_set():
-                    events.put(("done", (result, done)))
+                    self.events.put((task_id, "done", (result, done)))
             except Exception as exc:
                 if cancelled is None or not cancelled.is_set():
                     logging.exception("Operation failed: %s", description)
-                    events.put(("error", (exc, failed)))
+                    self.events.put((task_id, "error", (exc, failed)))
         threading.Thread(target=run, daemon=True).start()
 
     def finish_task(self):
         self.busy = False
+        self.active_task_id = None
         self.task_cancelled = None
         self.connecting_mail = False
+        self.reload_after = True
         self.progress.stop()
         self.update_connection_status()
 
@@ -1400,22 +1373,41 @@ class Workbench(tk.Tk):
         if self.task_cancelled is None:
             return
         self.task_cancelled.set()
-        self.events = queue.Queue()
+        # 旧任务编号立即失效，迟到的事件在 _poll 中会被丢弃。
+        self.active_task_id = None
         self.finish_task()
         self.update_actions()
-        self.status_text.set("已取消邮箱连接。")
+        self.status_text.set("已取消收票任务。")
         if self.import_dialog is not None:
             self.import_dialog.update_mail()
 
     def _poll(self):
         try:
             while True:
-                kind, payload = self.events.get_nowait()
+                task_id, kind, payload = self.events.get_nowait()
+                if task_id != self.active_task_id:
+                    continue
                 if kind == "progress":
                     self.status_text.set(payload)
                     continue
+                reload_after = self.reload_after
                 self.finish_task()
-                self.reload(discard_edits=kind == "done" and not self.preserve_edits)
+                if reload_after or kind == "error":
+                    # 失败时同步一次快照，确保断开或索引冲突能立即反映到界面。
+                    self.reload(discard_edits=kind == "done" and not self.preserve_edits)
+                else:
+                    # 只读任务不改资料，跳过全量重载和列表重建；仍做一次轻量会话校验，
+                    # 外部修改索引或冲突副本必须在结果落地前被发现。
+                    try:
+                        if self.store is None:
+                            raise UserError("资料会话已关闭，请重新启动工具。")
+                        self.store.verify()
+                    except (UserError, OSError, ValueError) as exc:
+                        self.connection_error(str(exc))
+                    else:
+                        if self.session_ok:
+                            self.status_text.set("已就绪。")
+                    self.update_actions()
                 if kind == "error":
                     error, callback = payload
                     if callback:
@@ -1496,24 +1488,35 @@ class Workbench(tk.Tk):
         self.clear_detail()
         self.reset_invoice_filters()
         self.dismiss_import_result()
+        task_id, emit = self._task_channel()
+
         def work():
             def progress(message):
-                self.events.put(("progress", message))
+                emit("progress", message)
 
             if files:
                 return store.import_files(revision, files, progress)
             return import_directory(store, revision, source, progress, scan_workspace=scan_workspace)
-        self.task("正在读取发票…", work, self.import_done, failed=self.import_failed)
+        self.task("正在读取发票…", work, self.import_done, failed=self.import_failed, task_id=task_id)
 
     def import_done(self, report):
         text = import_summary(report)
         issues = sum(row["result"] == "error" or bool(row.get("invoice_id") and row.get("detail"))
                      for row in report["items"])
+        reviews = len({row["review_id"] for row in report["items"] if row["result"] == "review"})
         banner = f"本次新增 {report['imported']} 张 · 自动归并 {report['merged']} 份原件 · {issues} 条异常"
+        if reviews:
+            banner += f" · {reviews} 项待审核"
         if not report["scanned"] and report["kind"] == "directory":
             text = banner = "没有找到支持的文件。"
         elif not report["scanned"] and not report["items"]:
-            banner = "所选日期范围内没有邮件。"
+            reused = report.get("mail_screening", {}).get("reused", 0)
+            banner = f"已复用 {reused} 封邮件的处理结果。" if reused else "所选日期范围内没有邮件。"
+        elif stats := report.get("mail_screening"):
+            if stats["deferred"]:
+                banner += f" · {stats['deferred']} 个附件可用深度扫描补查"
+            elif not report["items"]:
+                banner = f"已筛查 {report['scanned']} 封邮件，未识别到发票。"
         if report["kind"] in {"directory", "files"}:
             recent = report.get("source_directory", report["source"])
             self.settings = self.settings | {"last_import_directory": recent}
@@ -1521,7 +1524,7 @@ class Workbench(tk.Tk):
                 self._save_settings()
             except OSError:
                 logging.exception("无法保存最近导入目录")
-        self.show_import_result(banner, "warning" if issues else "success", report)
+        self.show_import_result(banner, "warning" if issues or reviews else "success", report)
         self.status_text.set(text)
         children = self.tree.get_children()
         if children:
@@ -1744,9 +1747,9 @@ class Workbench(tk.Tk):
 
         cancelled = threading.Event()
         self.task(login_prompt, lambda: mailbox.folders(cancelled=cancelled), choose,
-                  cancelled=cancelled, failed=failed)
+                  cancelled=cancelled, connecting_mail=True, failed=failed)
 
-    def start_mail_import(self, folder, source, bounds):
+    def start_mail_import(self, folder, source, bounds, *, deep_scan=False, force_rescan=False):
         if not self.session_ok or self.busy or self.mailbox is None:
             return
         store, revision = self.store, self.snapshot["revision"]
@@ -1759,12 +1762,16 @@ class Workbench(tk.Tk):
         self.dismiss_import_result()
         mailbox = self.mailbox
         blocked = self.settings.get("mail_blocked_domains", [])
+        cancelled = threading.Event()
+        task_id, emit = self._task_channel()
 
         def work():
             return import_mailbox(store, revision, mailbox, folder, source, bounds, blocked,
-                                  lambda message: self.events.put(("progress", message)))
+                                  lambda message: emit("progress", message), deep_scan=deep_scan,
+                                  force_rescan=force_rescan, cancelled=cancelled)
 
-        self.task("正在查找发票邮件…", work, self.import_done, failed=self.import_failed)
+        self.task("正在查找发票邮件…", work, self.import_done, failed=self.import_failed,
+                  cancelled=cancelled, task_id=task_id, pill="正在收票")
 
     def recognize_again(self):
         item = self.selected_item()
@@ -1914,13 +1921,9 @@ class Workbench(tk.Tk):
         if not dest:
             return
         store = self.store
-        def work():
-            built = store.export(batch["id"])
-            if built.resolve() != Path(dest).resolve():
-                shutil.copy2(built, dest)
-            return dest
-        self.task("正在导出报销材料…", work,
-                  lambda p: messagebox.showinfo("导出完成", f"已保存到\n{p}", parent=self))
+        self.task("正在导出报销材料…", lambda: store.export(batch["id"], destination=dest),
+                  lambda p: messagebox.showinfo("导出完成", f"已保存到\n{p}", parent=self),
+                  reload_after=False)
 
     def close_app(self):
         if self.busy and self.task_cancelled is None:
@@ -1931,12 +1934,21 @@ class Workbench(tk.Tk):
         if self.task_cancelled is not None:
             self.task_cancelled.set()
             self.finish_task()
+        self.preview.close()
         if self.store:
             self.store.close()
         self.mailbox = None
-        self.cancel_preview_render()
         self.after_cancel(self.poll_id)
         self.destroy()
+
+    def mainloop(self, n=0):
+        # 只有真正运行 Tk 事件循环时才启用后台预览；单步测试和脚本调用保持同步确定性。
+        if self.preview_async is not False:
+            self.preview.async_enabled = True
+        try:
+            return super().mainloop(n)
+        finally:
+            self.preview.async_enabled = False
 
 
 def main():

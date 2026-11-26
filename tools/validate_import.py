@@ -41,8 +41,11 @@ def check_export(store, batch_id):
         assert len(names) == len({n.casefold() for n in names}), "导出文件名重复"
         assert len(names) == 1 + sum(len(i["files"]) for i in batch["items"]), "导出文件数量不匹配"
         records = list(csv.DictReader(io.StringIO(archive.read("明细.csv").decode("utf-8-sig"))))
-        assert [r["价税合计"] for r in records] == [yuan(i["amount_cents"]) for i in batch["items"]], "CSV 金额不匹配"
-        assert [r["发票号码"] for r in records] == [i["number"] for i in batch["items"]], "CSV 票号不匹配"
+        # 导出明细按开票日期与票号稳定排序，不再是选票时的记录顺序。
+        ordered = sorted(batch["items"], key=lambda item: (item.get("date", ""), item.get("number", ""), item["id"]))
+        assert [r["价税合计"] for r in records] == [yuan(i["amount_cents"]) for i in ordered], "CSV 金额不匹配"
+        assert [r["发票号码"] for r in records] == [i["number"] for i in ordered], "CSV 票号不匹配"
+        assert [r["序号"] for r in records] == [str(n) for n in range(1, len(ordered) + 1)], "CSV 序号不连续"
         actual = Counter(hashlib.sha256(archive.read(n)).hexdigest() for n in names if n != "明细.csv")
         expected = Counter(f["hash"] for i in batch["items"] for f in i["files"])
         assert actual == expected, "导出原件哈希不匹配"

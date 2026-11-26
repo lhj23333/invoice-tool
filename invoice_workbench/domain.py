@@ -34,6 +34,20 @@ def normalize_name(text: str) -> str:
     return re.sub(r"\s+", "", text).replace("（", "(").replace("）", ")")
 
 
+def comparable(field: str, value: str) -> str:
+    """Normalize one extracted field for equality checks.
+
+    Full/half-width brackets, stray whitespace and tax id casing are
+    harmless differences between a PDF text layer and local OCR, so they
+    must never be reported as inconsistent originals.
+    """
+    if field in {"buyer_name", "seller_name"}:
+        return normalize_name(value)
+    if field == "buyer_tax_id":
+        return "".join(value.split()).upper()
+    return value
+
+
 def identity(invoice: dict) -> str | None:
     number = invoice.get("number", "")
     code = invoice.get("code", "")
@@ -107,14 +121,21 @@ def choose_invoices(invoices: list[dict], target: int, force_ids: list[str] | No
     if need > 0:
         unit = reduce(gcd, (i["amount_cents"] for i in rest))
         scaled_need = (need + unit - 1) // unit
-        # 任何可行组合都可以作为上界，更高的组合金额无需计算。
-        running = 0
-        for i in sorted(rest, key=lambda i: i["amount_cents"]):
-            running += i["amount_cents"] // unit
-            if running >= scaled_need:
+        scaled = sorted(i["amount_cents"] // unit for i in rest)
+        # 任何可行组合的总和都是最优解上界，取三种贪心里最紧的一个，
+        # 让 bitset 只覆盖到“够用就好”的金额，减少位宽和计算量。
+        ascending = 0
+        for amount in scaled:
+            ascending += amount
+            if ascending >= scaled_need:
                 break
-        singles = [i["amount_cents"] // unit for i in rest if i["amount_cents"] >= need]
-        bound = min([running] + singles)
+        descending = 0
+        for amount in reversed(scaled):
+            descending += amount
+            if descending >= scaled_need:
+                break
+        singles = [amount for amount in scaled if amount >= scaled_need]
+        bound = min(ascending, descending, *singles)
         rest = [i for i in rest if i["amount_cents"] // unit <= bound]
         if bound > 20_000_000 or (bound + 8) // 8 * (len(rest) + 1) > 64_000_000:
             raise UserError("本次精确选票超过内存预算。请排除部分发票或降低目标后重试；本次未返回近似推荐。")

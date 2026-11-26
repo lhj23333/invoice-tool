@@ -13,7 +13,7 @@ Windows 发票工作台，用于导入、核验和归档发票，按目标金额
 - [invoice_workbench/](invoice_workbench/) 保存应用源码。
 - [setup.ps1](setup.ps1) 和 [start.ps1](start.ps1) 用于安装和启动。
 - [tools/](tools/) 提供验证与便携包构建工具。
-- [tests/](tests/) 和 [samples/](samples/) 保存测试与样例。
+- [tests/](tests/) 和 [samples/](samples/) 保存测试与样例；便携包只分发运行所需的 `samples/`。
 
 ## 快速开始
 
@@ -42,6 +42,8 @@ Windows 发票工作台，用于导入、核验和归档发票，按目标金额
 
 1. 启用邮箱的 IMAP 服务，在「设置 → 邮箱收票」保存邮箱地址。可在「高级服务器设置」配置 IMAP 服务器和下载域名黑名单。
 2. 在「导入发票 → 从邮箱收票」连接邮箱，再选择文件夹和日期。Outlook 使用浏览器授权，其他邮箱使用授权码或应用专用密码。
+3. 再次收票时复用已完成的结果。勾选「深度扫描无线索的图片和扫描件」可补查之前延后的内容，勾选「重新扫描已处理邮件」可重新读取整个日期范围。
+4. 通过原件核验的发票会归档，同票来源自动归并。在「导入记录 → 待审核」查看暂时无法确认的附件、二维码图片和邮件线索，可核验附件、补充原件或排除。
 
 源码版在「高级服务器设置」填写 Outlook OAuth 客户端 ID。应用注册需配置 `http://localhost` 回调和委托 IMAP 权限。便携版由发布者提供客户端 ID。参见 [Microsoft 应用注册](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)与 [IMAP OAuth](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)。
 

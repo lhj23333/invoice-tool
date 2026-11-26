@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta
 import os
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .domain import UserError
 from .extract import SUPPORTED
@@ -11,16 +11,29 @@ from .theme import COLORS, FONT, wrap_label
 from .widgets import ScrollableFrame, SegmentedControl, SegmentedPages, StatusPill, WorkbenchDialog, hover_rows, table_scrollers
 
 
-IMPORT_RESULTS = {"imported": "新增", "merged": "归并", "duplicates": "重复", "error": "失败", "note": "提示"}
-RESULT_TONES = {"imported": "success", "merged": "info", "duplicates": "occupied", "error": "error", "note": "info"}
+IMPORT_RESULTS = {"imported": "新增", "merged": "归并", "duplicates": "重复", "error": "失败", "note": "提示",
+                  "review": "待审核", "reviewed": "已确认", "dismissed": "已排除"}
+RESULT_TONES = {"imported": "success", "merged": "info", "duplicates": "occupied", "error": "error", "note": "info",
+                "review": "warning", "reviewed": "success", "dismissed": "occupied"}
 MAIL_MODE, LOCAL_MODE = "从邮箱收票", "从本地导入"
-HISTORY_FILTERS = ("全部", "仅看异常", "邮箱收票", "本地导入")
+HISTORY_FILTERS = ("全部", "仅看异常", "待审核", "邮箱收票", "本地导入")
 
 
 def import_summary(report):
     unit = "封邮件" if report["kind"] == "mail" else "个文件"
     pending = {row["invoice_id"] for row in report["items"] if row.get("invoice_id") and row.get("detail")}
-    return (f"读取 {report['scanned']} {unit} · 新增 {report['imported']} 张 · 归并 {report['merged']} 份 · "
+    screened = ""
+    if stats := report.get("mail_screening"):
+        screened = (f" · 候选 {stats['candidates']} 封 · 已过滤 {stats['filtered']} 封"
+                    f" · 待深度扫描 {stats['deferred']} 个附件")
+        if stats["partial_bodies"]:
+            screened += f" · {stats['partial_bodies']} 段正文未读完"
+        if stats.get("reused"):
+            screened += f" · 复用 {stats['reused']} 封"
+    reviews = len({row["review_id"] for row in report["items"] if row["result"] == "review"})
+    if reviews:
+        screened += f" · 待审核 {reviews} 项"
+    return (f"读取 {report['scanned']} {unit}{screened} · 新增 {report['imported']} 张 · 归并 {report['merged']} 份 · "
             f"已有 {report['duplicates']} 项 · 核验异常 {len(pending)} 张 · 失败 {len(report['errors'])} 项")
 
 
@@ -161,6 +174,11 @@ class ImportDialog(WorkbenchDialog):
                          style="info.SettingsFeedback.TLabel", width=1, justify="left")
         hint.pack(fill="x")
         wrap_label(hint, inset=2 * space.small)
+        self.deep_scan = tk.BooleanVar(self, value=False)
+        self.deep_scan_option = ttk.Checkbutton(panel, text="深度扫描无线索的图片和扫描件", variable=self.deep_scan)
+        self.deep_scan_option.pack(anchor="w", pady=(space.small, 0))
+        self.force_rescan = tk.BooleanVar(self, value=False)
+        ttk.Checkbutton(panel, text="重新扫描已处理邮件", variable=self.force_rescan).pack(anchor="w", pady=(space.tiny, 0))
         self.start_date.trace_add("write", self._edit_dates)
         self.end_date.trace_add("write", self._edit_dates)
 
@@ -307,8 +325,11 @@ class ImportDialog(WorkbenchDialog):
                 return "break"
             if self.master.allow_discard(parent=self):
                 folder, name = self.folders[self.folder_choice.current()]
+                deep_scan = self.deep_scan.get()
+                force_rescan = self.force_rescan.get()
                 self.destroy()
-                self.master.start_mail_import(folder, f"{name} · {first} 至 {last}", bounds)
+                self.master.start_mail_import(folder, f"{name} · {first} 至 {last}", bounds,
+                                              deep_scan=deep_scan, force_rescan=force_rescan)
         return "break"
 
 
@@ -373,6 +394,13 @@ class ImportHistory(WorkbenchDialog):
         scroll.pack(side="right", fill="y")
         self.detail.configure(yscrollcommand=scroll.set)
         self.detail.pack(fill="x", expand=True)
+        self.review_actions = ttk.Frame(detail_box, style="Surface.TFrame")
+        self.review_open = ttk.Button(self.review_actions, text="查看附件", command=self._open_review)
+        self.review_verify = ttk.Button(self.review_actions, text="核验附件", command=self._resolve_review)
+        supplement = ttk.Button(self.review_actions, text="补充原件", command=lambda: self._resolve_review(supplement=True))
+        dismiss = ttk.Button(self.review_actions, text="排除", command=lambda: self._resolve_review(dismiss=True))
+        for button in (self.review_open, self.review_verify, supplement, dismiss):
+            button.pack(side="left", padx=(0, space.tiny))
         self.feedback = ttk.Label(detail_box, style="error.SettingsFeedback.TLabel", width=1, justify="left")
         wrap_label(self.feedback, inset=2 * space.small)
         rows = ttk.Frame(right)
@@ -415,6 +443,7 @@ class ImportHistory(WorkbenchDialog):
         self.visible_items.clear()
         query = self.search.get().strip().casefold()
         mode = self.filters.variable.get()
+        shown_reviews = set()
         for report_id, report in self.reports.items():
             mail = report["kind"] == "mail"
             if (mode == "邮箱收票" and not mail) or (mode == "本地导入" and mail):
@@ -425,10 +454,14 @@ class ImportHistory(WorkbenchDialog):
             for index, row in enumerate(report["items"]):
                 if mode == "仅看异常" and not self._has_issue(row):
                     continue
+                if mode == "待审核" and (row["result"] != "review" or row.get("review_id") in shown_reviews):
+                    continue
                 if report_match or any(query in str(row.get(key, "")).casefold()
                                        for key in ("file", "subject", "sender", "mailbox", "detail")):
                     visible[str(index)] = row
-            if not visible and (mode == "仅看异常" or not report_match):
+                    if mode == "待审核":
+                        shown_reviews.add(row.get("review_id"))
+            if not visible and (mode in {"仅看异常", "待审核"} or not report_match):
                 continue
             self.visible_items[report_id] = visible
             issues = sum(self._has_issue(row) for row in report["items"])
@@ -475,6 +508,8 @@ class ImportHistory(WorkbenchDialog):
         self.detail_status.configure(text=label)
         self.detail_status.set_tone(tone)
         message = [row[key] for key in ("file", "mailbox", "folder", "received", "sender", "subject", "detail") if row.get(key)]
+        if row.get("review_context"):
+            message.append(row["review_context"])
         if row.get("xml_analysis"):
             message.append("仅保留 XML 字段分析结果。")
         self.detail.configure(state="normal")
@@ -482,6 +517,12 @@ class ImportHistory(WorkbenchDialog):
         self.detail.insert("1.0", "\n".join(message))
         self.detail.configure(state="disabled")
         same_workspace = self.workspace is self.master.store and self.master.session_ok
+        self.review_actions.pack_forget()
+        if same_workspace and row.get("result") == "review" and row.get("review_id"):
+            self.review_actions.pack(fill="x", pady=(self.theme.space.tiny, 0))
+            original = row.get("review_object")
+            self.review_open.configure(state="normal" if original else "disabled")
+            self.review_verify.configure(state="normal" if original and not original["path"].endswith(".xml") else "disabled")
         self.open_mail_button.configure(state="normal" if same_workspace and row.get("mail_object") else "disabled")
         can_locate = same_workspace and row.get("invoice_id") in self.master.invoices_by_id
         self.locate_button.configure(state="normal" if can_locate else "disabled")
@@ -497,6 +538,43 @@ class ImportHistory(WorkbenchDialog):
         except (UserError, OSError) as exc:
             self.feedback.configure(text=str(exc))
             self.feedback.pack(fill="x", pady=(self.theme.space.tiny, 0))
+
+    def _open_review(self):
+        if self.workspace is self.master.store and self.master.session_ok and (file := self.current_row.get("review_object")):
+            try:
+                os.startfile(str(self.workspace.original(file)))
+            except (UserError, OSError) as exc:
+                self._review_failed(exc)
+
+    def _review_failed(self, error):
+        if self.winfo_exists():
+            self.feedback.configure(text=str(error))
+            self.feedback.pack(fill="x", pady=(self.theme.space.tiny, 0))
+
+    def _resolve_review(self, *, supplement=False, dismiss=False):
+        if self.workspace is not self.master.store or not self.master.session_ok or self.master.busy:
+            return
+        review_id = self.current_row.get("review_id")
+        if not review_id or self.current_row.get("result") != "review":
+            return
+        original = None
+        if supplement:
+            original = filedialog.askopenfilename(parent=self, title="选择发票原件",
+                                                  filetypes=[("发票原件", "*.pdf *.ofd *.png *.jpg *.jpeg")])
+            if not original:
+                return
+        if dismiss and not messagebox.askyesno("排除待审核材料", "将这项材料从待审核列表移除？", parent=self):
+            return
+        revision = self.master.snapshot["revision"]
+
+        def refresh(_):
+            if self.winfo_exists():
+                self.reports = {report["id"]: report for report in self.workspace.import_history()}
+                self._show_batches()
+
+        self.master.task("正在处理待审核材料…",
+                         lambda: self.workspace.decide_mail_review(revision, review_id, original=original, dismiss=dismiss),
+                         refresh, failed=self._review_failed)
 
     def _locate(self):
         if self.workspace is self.master.store and self.master.locate_imported_invoice(

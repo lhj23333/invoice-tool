@@ -2,10 +2,12 @@ from copy import deepcopy
 from email.message import EmailMessage
 from itertools import combinations
 import random
+from time import perf_counter
 import unittest
 import uuid
 import zipfile
 
+from invoice_workbench import store as store_module
 from invoice_workbench.domain import UserError, choose_invoices, company_matches, identity, money, validate_invoice, yuan
 from invoice_workbench.extract import extract, from_text
 from invoice_workbench.store import Store, csv_cell
@@ -47,6 +49,23 @@ class MoneyAndSolver(unittest.TestCase):
     def test_memory_limit_does_not_claim_approximate_optimum(self):
         with self.assertRaises(UserError):
             choose_invoices([{"id": "a", "amount_cents": 30_000_001}, {"id": "b", "amount_cents": 30_000_002}], 30_000_000)
+
+    def test_tighter_greedy_bound_keeps_global_minimum(self):
+        amounts = [990, 20, 20, 700]
+        invoices = [{"id": str(n), "date": "2026-01-01", "amount_cents": a} for n, a in enumerate(amounts)]
+        self.assertEqual(choose_invoices(invoices, 1000)["total_cents"], 1010)
+
+    def test_tight_bound_fits_budget_where_loose_bound_did_not(self):
+        # 升序贪心要跨过一张远大于目标的大票，旧上界会被撑到 2040 万，触发内存与上限拒绝；
+        # 单张即达标的发票让新上界收回到 1800 万，可以正常求得精确解。
+        amounts = [100_000] * 24 + [18_000_000]
+        invoices = [{"id": str(n), "date": "2026-01-01", "amount_cents": a} for n, a in enumerate(amounts)]
+        started = perf_counter()
+        result = choose_invoices(invoices, 4_000_000)
+        self.assertLess(perf_counter() - started, 15)
+        self.assertTrue(result["optimal"])
+        self.assertEqual(result["total_cents"], 18_000_000)
+        self.assertEqual(result["ids"], ["24"])
 
     def test_company_and_legacy_identity(self):
         self.assertEqual(identity({"number": "12345678", "code": "123456789012"}), "123456789012:12345678")
@@ -182,6 +201,56 @@ class StoreTests(StoreFixture, unittest.TestCase):
             self.store.review(self.rev(), ids[0], {**self.store.invoice(ids[0]), "amount": "600"})
         with self.assertRaises(UserError):
             self.store.archive(self.rev(), ids[0], True)
+
+    def test_external_change_blocks_idempotent_request_reuse(self):
+        self.import_one()
+        ids = [item["id"] for item in self.store.data["invoices"]]
+        request_id = uuid.uuid4().hex
+        self.store.create_batch(self.rev(), ids, "500", "500", request_id)
+        self.store.state_path.write_text(self.store.state_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        with self.assertRaises(UserError):
+            self.store.create_batch(self.rev(), ids, "500", "500", request_id)
+
+    def test_closed_session_blocks_idempotent_request_reuse(self):
+        self.import_one()
+        ids = [item["id"] for item in self.store.data["invoices"]]
+        request_id = uuid.uuid4().hex
+        self.store.create_batch(self.rev(), ids, "500", "500", request_id)
+        self.store.close()
+        with self.assertRaises(UserError):
+            self.store.create_batch(self.rev(), ids, "500", "500", request_id)
+
+    def test_history_snapshots_are_pruned_to_recent_versions(self):
+        original = store_module.MAX_HISTORY_FILES
+        store_module.MAX_HISTORY_FILES = 4
+        try:
+            for _ in range(9):
+                self.store.set_company(self.rev(), BUYER, TAX)
+        finally:
+            store_module.MAX_HISTORY_FILES = original
+        names = sorted(path.name for path in (self.store.root / "history").glob("*.json"))
+        revision = self.store.data["revision"]
+        self.assertEqual([int(name.split("-")[0]) for name in names],
+                         list(range(revision - 4, revision)))
+
+    def test_export_to_explicit_destination_leaves_workspace_clean(self):
+        batch_id = self.make_batch()
+        destination = self.root / "报销材料.zip"
+        destination.write_bytes(b"stale")
+        path = self.store.export(batch_id, destination=destination)
+        self.assertEqual(path, destination.resolve())
+        self.assertTrue(zipfile.is_zipfile(destination))
+        self.assertEqual(list((self.store.root / "exports").glob("*.zip")), [])
+        self.assertFalse(list(self.root.glob(".export-*.tmp")))
+        with zipfile.ZipFile(destination) as archive:
+            self.assertIn("明细.csv", archive.namelist())
+
+    def test_export_destination_requires_existing_directory(self):
+        batch_id = self.make_batch()
+        with self.assertRaises(UserError):
+            self.store.export(batch_id, destination=self.root)
+        with self.assertRaises(UserError):
+            self.store.export(batch_id, destination=self.root / "missing" / "a.zip")
 
     def test_invoice_return_releases_for_reuse(self):
         batch_id = self.make_batch()

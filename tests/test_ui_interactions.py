@@ -91,6 +91,26 @@ class InteractionTests(unittest.TestCase):
         self.app.filter_control.buttons[0].invoke()
         self.assertEqual(len(self.app.tree.get_children()), 2)
 
+    def test_live_search_matches_original_filename_and_note(self):
+        app = self.app
+        app.search.set("b.xml")
+        app.fill_invoices()
+        self.assertEqual([app.tree.set(iid, "number") for iid in app.tree.get_children()],
+                         ["26000000000000000002"])
+        app.clear_search()
+        store = app.store
+        item = next(i for i in store.data["invoices"] if i["number"] == "26000000000000000001")
+        with store.change(store.data["revision"]):
+            store.invoice(item["id"])["note"] = "十一月办公用品"
+        app.reload()
+        app.search.set("十一月办公用品")
+        app.fill_invoices()
+        self.assertEqual([app.tree.set(iid, "number") for iid in app.tree.get_children()],
+                         ["26000000000000000001"])
+        app.clear_search()
+        app.fill_invoices()
+        self.assertEqual(len(app.tree.get_children()), 2)
+
     def test_metrics_and_empty_actions_share_invoice_filters(self):
         app = self.app
         app.metric_buttons["可用"].invoke()
@@ -168,6 +188,10 @@ class InteractionTests(unittest.TestCase):
 
         dialog = open_scope()
         today = date.today()
+        self.assertTrue(dialog.deep_scan_option.winfo_ismapped())
+        self.assertFalse(dialog.deep_scan.get())
+        dialog.deep_scan_option.invoke()
+        self.assertTrue(dialog.deep_scan.get())
         presets = {button.cget("text"): button for button in dialog.presets.buttons}
         presets["近 30 天"].invoke()
         self.assertEqual(dialog.start_date.get(), (today - timedelta(days=29)).isoformat())
@@ -191,6 +215,7 @@ class InteractionTests(unittest.TestCase):
         self.assertIsNone(self.app.grab_current())
 
         dialog = open_scope()
+        self.assertFalse(dialog.deep_scan.get())
         dialog.focus_force()
         self.app.update()
         dialog.event_generate("<Escape>")
@@ -271,6 +296,24 @@ class InteractionTests(unittest.TestCase):
         self.assertFalse(dialog.winfo_exists())
         self.assertEqual(self.app.current_id, report["items"][int(imported[0])]["invoice_id"])
         self.assertEqual((self.app.search.get(), self.app.filter.get()), ("", "全部"))
+
+    def test_mail_review_filter_shows_existing_evidence_and_review_actions(self):
+        xml = Path(__file__).resolve().parents[1] / "samples" / "sample-04.xml"
+        store = self.app.store
+        store.import_mail(store.data["revision"], "收件箱", 1, [{"file": xml.name, "payload": xml}])
+        self.app.reload()
+        self.app.open_import_history()
+        dialog = next(window for window in self.app.winfo_children() if isinstance(window, ImportHistory))
+        button = next(button for button in dialog.filters.buttons if button.cget("text") == "待审核")
+        button.invoke()
+        self.app.update()
+        self.assertEqual(dialog.current_row["file"], xml.name)
+        self.assertTrue(dialog.review_open.winfo_viewable())
+        self.assertFalse(dialog.review_open.instate(["disabled"]))
+        self.assertTrue(dialog.review_verify.instate(["disabled"]))
+        self.assertTrue(dialog_button(dialog.review_actions, "补充原件").winfo_viewable())
+        self.assertTrue(dialog_button(dialog.review_actions, "排除").winfo_viewable())
+        self.assertTrue(dialog.locate_button.instate(["disabled"]))
 
     def test_filter_clears_clean_details_when_the_invoice_leaves_the_list(self):
         tree = self.app.tree

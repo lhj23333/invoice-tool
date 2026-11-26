@@ -3,6 +3,7 @@ from email.message import EmailMessage
 from pathlib import Path
 import tempfile
 from threading import Event
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -27,8 +28,17 @@ class GuiTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_empty_window_builds_and_closes(self):
+        self.app.deiconify()
+        self.app.update()
         self.assertEqual(len(self.app.tree.get_children()), 0)
         self.assertEqual(self.app.stats[0].get(), "0")
+        self.assertTrue(self.app.tree.winfo_viewable())
+        self.assertTrue(self.app.intake_button.winfo_viewable())
+        self.assertFalse(self.app.empty_card.winfo_viewable())
+
+        self.app.search_entry.insert(0, "发票")
+        self.app.update_idletasks()
+        self.assertFalse(self.app.empty_card.winfo_viewable())
 
     def test_xml_analysis_record_displays_without_a_stored_original(self):
         source = self.root / "source"
@@ -158,7 +168,7 @@ class GuiTests(unittest.TestCase):
             release.wait(5)
             completed.set()
 
-        self.app.task("正在连接 Outlook IMAP", connect, cancelled=cancelled)
+        self.app.task("正在连接 Outlook IMAP", connect, cancelled=cancelled, connecting_mail=True)
         try:
             self.assertIn("正在连接", self.app.mail_session_pill.cget("text"))
             self.app.cancel_task_button.invoke()
@@ -170,6 +180,39 @@ class GuiTests(unittest.TestCase):
         finally:
             release.set()
             self.assertTrue(completed.wait(2))
+
+    def test_stale_task_progress_from_previous_task_is_ignored(self):
+        stale_id, stale_emit = self.app._task_channel()
+        release = Event()
+        self.app.task("新任务", release.wait)
+        try:
+            self.app.update()
+            stale_emit("progress", "过期进度")
+            time.sleep(0.15)
+            self.app.update()
+            self.assertEqual(self.app.status_text.get(), "新任务")
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while self.app.busy and time.monotonic() < deadline:
+                self.app.update()
+                time.sleep(0.01)
+            self.assertFalse(self.app.busy)
+
+    def test_cancel_discards_late_events_from_the_cancelled_task(self):
+        cancelled = Event()
+        self.app.task("正在收票", cancelled.wait, cancelled=cancelled)
+        stale_id = self.app.active_task_id
+        self.app.update()
+        self.app.cancel_task_button.invoke()
+        self.assertEqual(self.app.status_text.get(), "已取消收票任务。")
+        self.app.events.put((stale_id, "done", ("结果", None)))
+        self.app.events.put((stale_id, "progress", "过期进度"))
+        cancelled.set()
+        time.sleep(0.15)
+        self.app.update()
+        self.assertFalse(self.app.busy)
+        self.assertEqual(self.app.status_text.get(), "已取消收票任务。")
 
     def test_native_close_releases_workspace_while_connecting_mail(self):
         cancelled = Event()
